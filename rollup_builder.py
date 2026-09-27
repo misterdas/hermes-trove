@@ -714,7 +714,10 @@ def mark_stale_for_published_summary(
         store = RollupStore(dag.db_path)
         return store.drain_invalidations(event_limit=256, day_budget=256) * 3
     except Exception:
-        logger.debug("TROVE temporal rollup publication staleness update failed", exc_info=True)
+        # A failed drain leaves covering rollups `ready` and stale, so
+        # trove_recent serves outdated period summaries. Warn, not debug:
+        # the operator cannot see this any other way.
+        logger.warning("TROVE temporal rollup publication staleness update failed", exc_info=True)
         return 0
     finally:
         if store is not None:
@@ -730,7 +733,9 @@ def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> in
         drained = store.drain_invalidations(event_limit=256, day_budget=256)
         return drained if before else 0
     except Exception:
-        logger.debug("TROVE temporal rollup deletion staleness update failed", exc_info=True)
+        # Same reasoning as the publication path: a failed drain leaves the
+        # deleted nodes' rollups `ready` and stale.
+        logger.warning("TROVE temporal rollup deletion staleness update failed", exc_info=True)
         return 0
     finally:
         if store is not None:

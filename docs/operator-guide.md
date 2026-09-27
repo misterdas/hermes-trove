@@ -247,6 +247,81 @@ environment variables:
 | `TROVE_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `TROVE_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `TROVE_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+| `TROVE_RETENTION_APPLY_ENABLED` | `true` | Permit the destructive `/trove doctor retention apply` workflow. `TROVE_RETENTION_DAYS` remains the safety gate (`0` = never delete); set this `false` to hard-disable apply on shared or multi-user hosts |
+| `TROVE_CUSTOM_INSTRUCTIONS` | empty | Custom instructions injected into every summarization prompt (host/project conventions for what a summary should preserve) |
+
+### Retrieval budgets and scan bounds
+
+`trove_recall` scans the WHOLE corpus by default; these bound its cost without
+hiding old memories. A capped or budgeted scan reports `coverage: "bounded"`
+and discloses the scanned/total ratio — it never claims full coverage it did
+not achieve.
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_RECALL_SCAN_ROWS` | `25000` | Vectors RESIDENT PER BATCH, not a corpus cap. A running top-k spans batches, so this trades peak memory, not coverage. This was a hard bound once and recall for ageing content went to zero at 185k vectors (FINDING-F31 §2) |
+| `TROVE_RECALL_SCAN_MAX_ROWS` | `0` | Hard candidate cap for the whole scan; `0` = unlimited. Set only for a pathological corpus — a capped scan reports `coverage: "bounded"` |
+| `TROVE_RECALL_SCAN_BUDGET_S` | `0.0` | Hard latency budget for the scan in seconds; `0` = no early stop. When set, an overrunning scan stops between batches and degrades to `coverage: "bounded"` rather than paying an unbounded cost |
+| `TROVE_RECALL_QUERY_TIMEOUT_S` | `8.0` | Deadline for `trove_recall`, which fans out three sequential arms plus fusion, hydration, and an optional rerank. Needs more headroom than `trove_grep`'s single-arm 3.0s deadline |
+| `TROVE_RECALL_REFERENCE_STRICT` | `true` | Drop recall hits that cannot be cited as evidence: the next-ranked citable hit takes the slot and the omission is surfaced in `provenance.answer_ready`. ON because delivering uncitable evidence is a correctness defect and validating consumers fail CLOSED on one. Set `false` only for a host that renders recall without citations |
+
+### Assembly and escalation guards
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_MAX_ASSEMBLY_TOKENS` | `0` | Hard cap for the assembled active context; `0` disables the cap |
+| `TROVE_RESERVE_TOKENS_FLOOR` | `0` | Reserve tokens from the model context window before assembly. Effective cap becomes `context_length - reserve_tokens_floor`; `0` disables |
+| `TROVE_L2_BUDGET_RATIO` | `0.50` | L2 bullet budget as a fraction of the L1 budget during escalation |
+| `TROVE_L3_TRUNCATE_TOKENS` | `512` | Deterministic L3 truncate token limit — the no-LLM fallback when summary spend is exhausted |
+
+### Condensation and deferred maintenance
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_CONDENSATION_FANIN` | `4` | How many same-depth summaries trigger one condensation pass |
+| `TROVE_CACHE_FRIENDLY_CONDENSATION_ENABLED` | `false` | Suppress follow-on condensation after a leaf pass unless debt/pressure justifies the extra prompt churn (keeps the KV cache stable) |
+| `TROVE_CACHE_FRIENDLY_MIN_DEBT_GROUPS` | `2` | Minimum same-depth fanin groups before one follow-on condensation pass is allowed in cache-friendly mode |
+| `TROVE_DEFERRED_MAINTENANCE_ENABLED` | `false` | Let a turn persist raw-backlog maintenance debt and spend later bounded catch-up passes reducing it, instead of doing the work inline |
+| `TROVE_DEFERRED_MAINTENANCE_MAX_PASSES` | `4` | Maximum extra leaf passes a debt-triggered later turn may spend on catch-up |
+
+### Spend guards
+
+Query-path embedding embeds and paid summarizer calls run under separate
+sliding-window guards with DIFFERENT budgets. Do not unify them: the backfill
+path is bulk work that must not be throttled by a query-shaped ceiling.
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_SUMMARY_SPEND_MAX_CALLS` | `24` | Sliding-window cap on paid/auxiliary summarizer calls before falling back to deterministic L3 truncation. `0` disables the guard |
+| `TROVE_SUMMARY_SPEND_WINDOW_SECONDS` | `600.0` | Window over which summary spend calls are counted |
+| `TROVE_SUMMARY_SPEND_BACKOFF_SECONDS` | `1800.0` | Backoff applied after the summary spend window is exhausted |
+| `TROVE_EMBEDDING_QUERY_SPEND_MAX_CALLS` | `600` | Sliding-window cap on query-path embeds before pre-network rejection with `ProviderRateLimited`. Deliberately generous: a tight ceiling once gutted retrieval when a benchmark fired hundreds of query embeds in a minute for negligible spend. `0` disables; the backfill path keeps its own `max_calls=0` contract and is unaffected |
+| `TROVE_EMBEDDING_QUERY_SPEND_WINDOW_SECONDS` | `60.0` | Window over which query-path embed calls are counted |
+| `TROVE_EMBEDDING_QUERY_SPEND_BACKOFF_SECONDS` | `60.0` | Backoff applied after the query embed window is exhausted |
+| `TROVE_EMBEDDING_MAX_BATCH_ITEMS` | `1000` | Item cap per embeddings request. Voyage caps a single request at 1000 input items; document batches split at this count in addition to the token budget |
+| `TROVE_EMBED_CONTENT_POLICY` | `conversational` | Content-aware chunk policy for the raw-history chunk corpus: `conversational`, `heads`, or `full`. Unknown values degrade to `conversational` in the chunker's `normalize_content_policy` |
+
+### Extraction (pre-compaction)
+
+Default-off: extraction sends source text to the configured extraction/summary
+model.
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_EXTRACTION_ENABLED` | `false` | Extract decisions and commitments to files before compaction |
+| `TROVE_EXTRACTION_OUTPUT_PATH` | empty | Directory for daily extraction files; empty auto-selects `~/.hermes/trove-extractions/` |
+
+### Temporal rollups
+
+Day/week/month summaries feed `trove_recent` for a time window. A rollup is
+served only when EVERY period in the window is `ready` and covers exactly the
+right sessions; otherwise `trove_recent` reports why and falls back to raw
+messages. Never a partial answer.
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `TROVE_TEMPORAL_ROLLUPS_ENABLED` | `false` | Pre-summarize conversations by UTC day, then week and month from those day summaries. Costs real summarizer calls and shares the summary spend guard |
+| `TROVE_ROLLUP_MAINTENANCE_BUDGET_MS` | `5000` | Best-effort wall-clock budget checked between builds. A slow summarizer may finish its current build and leave later rollups lagging until a future pass |
 
 ### Evidence and adaptive retrieval (0.21 RC)
 
