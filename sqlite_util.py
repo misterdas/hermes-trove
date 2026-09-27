@@ -263,32 +263,46 @@ def _is_index_corruption_detail(detail: object) -> bool:
     return bool(message) and ("missing from index" in message or "wrong # of entries in index" in message)
 
 
-def _integrity_failure_details(conn: sqlite3.Connection) -> list[str]:
-    """Run PRAGMA integrity_check and return the raw failure detail rows."""
+def _integrity_failure_details(conn: sqlite3.Connection) -> list[str] | None:
+    """Run PRAGMA integrity_check and return the raw failure detail rows.
+
+    Returns ``None`` when the check could not RUN, which is NOT the same as
+    ``[]`` ("ran, found nothing"). Callers must treat the two differently: a
+    check that failed to execute proves nothing about the database, so
+    reporting it as clean would silently disable the damage detection this
+    whole path exists for. An earlier version swallowed the error and returned
+    ``[]``, which made "cannot check" indistinguishable from "healthy".
+    """
     try:
         rows = conn.execute("PRAGMA integrity_check").fetchall()
     except sqlite3.Error:
-        return []
-    details = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
-    return details
+        return None
+    return [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
 
 
 def startup_index_self_heal(conn: sqlite3.Connection) -> dict[str, object]:
     """Verify b-tree/index consistency on open, rebuilding damaged indexes.
 
-    Runs the full ``PRAGMA integrity_check`` cross-check on every store open
-    (process boot is rare, so the O(db size) cost is acceptable — and it is
-    the only pragma that catches index-vs-table drift; ``quick_check``
-    provably misses this fault class in production). When the failure details
-    name only missing/wrong index rows, it runs the minimal in-place
-    ``REINDEX``. Data rows are never modified, the database file is never
-    renamed or moved, and sibling processes' open connections are unaffected.
-    Genuine page-level or structural damage is never auto-repaired; it is
-    returned for the doctor to surface.
+    Runs the full ``PRAGMA integrity_check`` cross-check on every store open.
+    ``quick_check`` provably misses this fault class in production, so the
+    deeper pragma is the right one. When the failure details name only
+    missing/wrong index rows, it runs the minimal in-place ``REINDEX``. Data
+    rows are never modified, the database file is never renamed or moved, and
+    sibling processes' open connections are unaffected. Genuine page-level or
+    structural damage is never auto-repaired; it is returned for the doctor to
+    surface.
 
-    Returns ``{"healed": bool, "details": [...]}``.
+    Returns ``{"healed": bool, "details": [...]}``. ``healed`` is only ever
+    True after a verification that actually ran and came back clean — a
+    verification that could not run reports the drift as unrepaired rather
+    than claiming success.
     """
     details = _integrity_failure_details(conn)
+    if details is None:
+        # The check could not execute. Say so instead of reporting health: a
+        # check that did not run is not evidence of anything, and an empty
+        # "details" here would read as clean at every call site.
+        return {"healed": False, "details": ["integrity_check could not run"]}
     if not details:
         return {"healed": False, "details": []}
     if not any(_is_index_corruption_detail(detail) for detail in details):
@@ -302,6 +316,10 @@ def startup_index_self_heal(conn: sqlite3.Connection) -> dict[str, object]:
         except sqlite3.Error:
             break
         remaining = _integrity_failure_details(conn)
+        if remaining is None:
+            # The post-REINDEX verification failed to run. We cannot claim the
+            # drift is gone, so keep the original details and report unhealed.
+            break
         if not remaining:
             healed = True
             details = []

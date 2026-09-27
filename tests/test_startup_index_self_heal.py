@@ -14,6 +14,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_trove.sqlite_util import (
+    _integrity_failure_details,
     _is_index_corruption_detail,
     startup_index_self_heal,
 )
@@ -90,6 +91,58 @@ class TestStartupIndexSelfHeal:
         result = startup_index_self_heal(conn)
         assert result["healed"] is False
         assert conn.reindex_calls == 0
+
+
+class TestCheckThatCannotRunIsNotClean:
+    """A verification that failed to execute must not read as "healthy".
+
+    ``_integrity_failure_details`` used to swallow every sqlite3.Error and
+    return ``[]``, which is the same value it returns for a clean database.
+    That made "the check could not run" indistinguishable from "ran, found
+    nothing" — so a broken or busy connection silently disabled the damage
+    detection, and the post-REINDEX verification reported a repair it had
+    never confirmed. It now returns ``None`` for "could not run".
+    """
+
+    def test_could_not_run_is_none_not_empty(self):
+        conn = sqlite3.connect(":memory:")
+        conn.close()  # every statement now raises ProgrammingError
+        assert _integrity_failure_details(conn) is None
+
+    def test_healthy_db_is_empty_list(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t(x)")
+        assert _integrity_failure_details(conn) == []
+        conn.close()
+
+    def test_heal_reports_unverified_when_check_cannot_run(self, monkeypatch):
+        calls = {"n": 0}
+
+        def flaky(conn):
+            calls["n"] += 1
+            # 1st call: drift found (enter the heal loop). 2nd: cannot run.
+            return ["wrong # of entries in index idx_x"] if calls["n"] == 1 else None
+
+        monkeypatch.setattr(
+            "hermes_trove.sqlite_util._integrity_failure_details", flaky
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE messages(x)")
+        conn.execute("CREATE INDEX idx_x ON messages(x)")
+        result = startup_index_self_heal(conn)
+        conn.close()
+
+        assert result["healed"] is False, "claimed a repair it never verified"
+        assert result["details"], "a failed verification must still surface"
+
+    def test_check_failure_surfaces_instead_of_reporting_health(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_trove.sqlite_util._integrity_failure_details", lambda conn: None
+        )
+        conn = sqlite3.connect(":memory:")
+        result = startup_index_self_heal(conn)
+        conn.close()
+        assert result["details"] == ["integrity_check could not run"]
 
 
 class TestOpenNeverUnlinksSidecars:
