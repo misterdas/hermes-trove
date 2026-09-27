@@ -2650,15 +2650,16 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
 _MESSAGES_IDENTITY_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_identity "
     "ON messages(session_id, role, observed_at, "
-    "COALESCE(tool_call_id, ''), COALESCE(content, ''))"
+    "COALESCE(tool_call_id, ''), COALESCE(content, ''), "
+    "COALESCE(tool_calls, ''))"
 )
 
 
 def ensure_message_identity_index(conn: sqlite3.Connection) -> None:
     """Create the per-message identity unique index (additive, idempotent).
 
-    The index is an *expression* index: ``tool_call_id`` and ``content``
-    are COALESCEd to ``''`` so that NULL/empty values participate in
+    The index is an *expression* index: ``tool_call_id``, ``content``, and
+    ``tool_calls`` are COALESCEd to ``''`` so that NULL/empty values participate in
     identity the same way the dedup's grouping and the store's conflict
     lookup do (a plain column list would let two NULLs through, and
     ``ON CONFLICT`` on a column list cannot see expression indexes).
@@ -2678,7 +2679,7 @@ def _has_named_migration_step(conn: sqlite3.Connection, step_name: str) -> bool:
 
 
 def _earlier_cluster_member_expr(table: str) -> str:
-    """``EXISTS`` clause: an *earlier* row with the same identity 5-tuple.
+    """``EXISTS`` clause: an *earlier* row with the same identity 6-tuple.
 
     Null-safe equality on the identity columns (``IS`` for
     ``observed_at``; ``COALESCE`` to ``''`` for ``tool_call_id``/``content``
@@ -2694,7 +2695,8 @@ def _earlier_cluster_member_expr(table: str) -> str:
         f"AND m2.role = {table}.role "
         f"AND m2.observed_at IS {table}.observed_at "
         f"AND COALESCE(m2.tool_call_id, '') = COALESCE({table}.tool_call_id, '') "
-        f"AND COALESCE(m2.content, '') = COALESCE({table}.content, '')"
+        f"AND COALESCE(m2.content, '') = COALESCE({table}.content, '') "
+        f"AND COALESCE(m2.tool_calls, '') = COALESCE({table}.tool_calls, '')"
     )
 
 
@@ -2824,7 +2826,8 @@ def dedup_message_identity_clusters(conn: sqlite3.Connection) -> int:
               WHERE observed_at IS NOT NULL
               GROUP BY session_id, role, observed_at,
                        COALESCE(tool_call_id, ''),
-                       COALESCE(content, '')
+                       COALESCE(content, ''),
+                       COALESCE(tool_calls, '')
           )
         """
     )
@@ -3778,6 +3781,37 @@ def run_message_identity_migration(conn: sqlite3.Connection) -> int:
             )
             return 0
         mark_migration_step_complete(conn, "messages_identity_index_v1")
+
+        # v2: upgrade the identity index to include tool_calls. The v1 index
+        # (without tool_calls) exists at this point and pages beyond the
+        # existing callers of this function; CREATE IF NOT EXISTS skips it. We
+        # explicitly drop + recreate under a named marker so legacy installs get
+        # the column without manual SQL. Rolling back this marker is not
+        # supported: the v1 index definition has been removed from
+        # `_MESSAGES_IDENTITY_INDEX`, so recreating without the marker loses the
+        # previous column shape and a re-upgrade would still land v2.
+        if not _has_named_migration_step(conn, "messages_identity_index_v2"):
+            try:
+                conn.execute("DROP INDEX IF EXISTS idx_msg_identity")
+                ensure_message_identity_index(conn)
+                mark_migration_step_complete(conn, "messages_identity_index_v2")
+            except sqlite3.IntegrityError:
+                logger.warning(
+                    "TROVE identity index upgrade to v2 (tool_calls) failed: "
+                    "duplicate message-identity clusters exist. The v1 index was "
+                    "dropped; run_message_identity_dedup to remove duplicates and "
+                    "land the v2 index on next open."
+                )
+            except sqlite3.OperationalError as exc:
+                # Fresh DB: v1 was just created successfully but the v2 drop
+                # + recreate fails because the table exists — the existing index
+                # is on a clean DB so we just recreate it. Any other
+                # OperationalError is genuinely unexpected and should reach the
+                # caller so operators can see it.
+                logger.warning(
+                    "TROVE identity index v2 recreate failed after v1 landed: %s; continuing with v1 shape",
+                    exc,
+                )
 
     return 0
 

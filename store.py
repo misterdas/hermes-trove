@@ -606,14 +606,14 @@ class MessageStore:
 
         ``row_params`` is the 14-tuple matching ``_INSERT_MESSAGE_SQL``
         (indexes: 0=session_id, 3=role, 4=content, 5=tool_call_id,
-        12=observed_at). A conflict means the host re-sent an
+        6=tool_calls, 12=observed_at). A conflict means the host re-sent an
         already-persisted message (compaction replay, session rebind, or
         recovery replay): the existing row is the canonical one, so
         callers must receive its ``store_id`` rather than a fresh id.
 
         The uniqueness backstop is the ``idx_msg_identity`` *expression*
-        index, which COALESCEs ``tool_call_id``/``content`` to ``''`` so NULL
-        values participate in identity (a column-list index would let two
+        index, which COALESCEs ``tool_call_id``/``content``/``tool_calls`` to
+        ``''`` so NULL values participate in identity (a column-list index
         NULLs through). That same expression nature is why this cannot use
         ``ON CONFLICT(...) DO NOTHING`` (SQLite rejects an expression index
         as an ON CONFLICT target), so we instead:
@@ -646,13 +646,14 @@ class MessageStore:
                 # but fail loudly rather than invent a row if we ever get here.
                 raise RuntimeError(
                     "message identity conflict without an observed_at "
-                    "(session_id, role, tool_call_id, content)"
+                    "(session_id, role, tool_call_id, content, tool_calls)"
                 ) from err
             existing = self._conn.execute(
                 "SELECT store_id FROM messages WHERE session_id = ? AND role = ? "
                 "AND observed_at IS ? "
                 "AND COALESCE(tool_call_id, '') = ? "
                 "AND COALESCE(content, '') = ? "
+                "AND COALESCE(tool_calls, '') = ? "
                 "ORDER BY store_id LIMIT 1",
                 (
                     row_params[0],
@@ -660,6 +661,7 @@ class MessageStore:
                     row_params[12],
                     (row_params[5] if row_params[5] is not None else ""),
                     (row_params[4] if row_params[4] is not None else ""),
+                    (row_params[6] if row_params[6] is not None else ""),
                 ),
             ).fetchone()
             if existing is None:
@@ -667,7 +669,7 @@ class MessageStore:
                 # the state is inconsistent; fail loudly rather than invent a row.
                 raise RuntimeError(
                     "message identity conflict without a matching stored row "
-                    "(session_id, role, observed_at, tool_call_id, content)"
+                    "(session_id, role, observed_at, tool_call_id, content, tool_calls)"
                 ) from err
             return int(existing[0])
 
@@ -677,7 +679,7 @@ class MessageStore:
         """Persist a message and return its store_id.
 
         If a message with the same identity 5-tuple
-        ``(session_id, role, observed_at, tool_call_id, content)`` is
+        ``(session_id, role, observed_at, tool_call_id, content, tool_calls)`` is
         already stored, no duplicate row is created and the pre-existing
         (earliest) row's ``store_id`` is returned instead, keeping every
         caller's id list aligned with the input message list (replay /
