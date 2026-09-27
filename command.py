@@ -3040,16 +3040,13 @@ def _count_inflight(conn: sqlite3.Connection, identity_hash: str | None = None) 
     # filter by identity, correctly reports 0. Dead rows for a retired model are
     # not in-flight work.
     try:
-        if identity_hash:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM trove_embedding_backfill_inflight "
-                "WHERE identity_hash = ?",
-                (identity_hash,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM trove_embedding_backfill_inflight"
-            ).fetchone()
+        # (? IS NULL OR identity_hash = ?) is the "no filter" default: every
+        # caller either passes a hash or asks for the unfiltered count.
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trove_embedding_backfill_inflight "
+            "WHERE ? IS NULL OR identity_hash = ?",
+            (identity_hash, identity_hash),
+        ).fetchone()
         return int(row[0]) if row is not None else 0
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():

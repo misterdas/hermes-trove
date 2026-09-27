@@ -541,12 +541,10 @@ class QueryViewStore:
             str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False
         )
         self._write_lock = threading.RLock()
-        # Shared process-wide lock (2026-09-26 audit). QueryViewStore is
-        # constructed on the SAME db_path as MessageStore and holds its own
-        # connection, so the per-instance ``_write_lock`` cannot serialize a
-        # view claim against the gateway's ingest. The savepoint reentrancy
-        # below is unchanged; the process lock is an RLock taken OUTSIDE it so
-        # nested transactions still work.
+        # Process-wide lock, not a per-instance one: this store holds its own
+        # connection on the same db_path, so a view claim can otherwise collide
+        # with the gateway's ingest. Taken OUTSIDE the savepoint reentrancy
+        # below, so nested transactions still work. See process_write_lock.
         self._process_lock = process_write_lock(self.db_path)
         self._transaction_depth = 0
         try:

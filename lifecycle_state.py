@@ -66,12 +66,8 @@ class LifecycleStateStore:
         # The connection is opened check_same_thread=False in autocommit mode
         # and is shared across the gateway thread, dispatcher, and sub-agents.
         # Serialize read-modify-write flows so concurrent binds/frontier
-        # advances cannot interleave and regress the checkpoint. This is the
-        # process-wide lock for the db_path (t4 follow-up, 2026-09-27 audit),
-        # not a per-instance one: SQLite's own busy handler only serializes
-        # write *transactions*, and a lifecycle bind colliding with the
-        # gateway's ingest on the same WAL otherwise waits out busy_timeout
-        # and loses the write.
+        # advances cannot interleave and regress the checkpoint. Process-wide,
+        # not per-instance: see process_write_lock.
         self._lock = process_write_lock(self.db_path)
         self._init_db()
 

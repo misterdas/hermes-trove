@@ -229,16 +229,10 @@ class AssertionStore:
     def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
-        # Process-wide write lock (t4 follow-up, 2026-09-27 audit). This store
-        # opens its own connection on the SAME db_path as MessageStore and the
-        # DAG, so a per-instance lock cannot serialize a publish against the
-        # gateway's ingest: the colliding writer waits out busy_timeout
-        # (30s default) and then raises OperationalError with the write lost.
-        # Adopting the shared lock makes every store's write transaction
-        # serialize in-process, which is the only coordination SQLite's
-        # cross-process file locks cannot provide. Safe to hold for the whole
-        # publish: assertion rows are prepared before the lock is taken, so it
-        # never spans a blocking network call.
+        # Process-wide lock, not a per-instance one: this store holds its own
+        # connection on the same db_path, and a per-instance lock cannot
+        # serialize a publish against the gateway's ingest. Never held across a
+        # blocking network call (rows are prepared before the lock is taken).
         self._write_lock = process_write_lock(self.db_path)
         self._conn = self._open_connection()
         try:

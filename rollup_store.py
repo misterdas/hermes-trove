@@ -59,11 +59,10 @@ class RollupStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
-        # Shared process-wide lock (2026-09-26 audit). RollupStore is constructed
-        # on the SAME db_path as MessageStore and holds its own connection, so
-        # the per-instance ``_write_lock`` cannot serialize a rollup claim
-        # against the gateway's ingest. Without this, busy_timeout expiry raises
-        # OperationalError and the claim row is silently lost.
+        # Process-wide lock, not a per-instance one: this store holds its own
+        # connection on the same db_path, so a rollup claim can otherwise
+        # collide with the gateway's ingest and be silently lost on
+        # busy_timeout expiry. See process_write_lock.
         self._process_lock = process_write_lock(self.db_path)
         self._init_db()
 

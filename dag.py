@@ -170,14 +170,9 @@ class SummaryDAG:
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.RLock()
-        # Shared process-wide lock (t4 follow-up, 2026-09-26 audit). The DAG is
-        # opened on the SAME db_path as MessageStore and VectorStore, and it
-        # holds its own independent connection. The per-instance ``_db_lock``
-        # above only guards this one connection, so a node insert could still
-        # collide with the gateway's ingest on the same WAL file. Taking the
-        # shared lock makes this connection's write transactions serialize
-        # against every other connection in the process, which is the only
-        # coordination SQLite's cross-process file locks cannot provide.
+        # Process-wide lock, not a per-instance one: the DAG holds its own
+        # connection on the same db_path as MessageStore, and ``_db_lock`` only
+        # guards this one connection. See process_write_lock.
         self._process_lock = process_write_lock(self.db_path)
         self._init_db()
 

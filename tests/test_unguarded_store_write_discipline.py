@@ -16,8 +16,12 @@ These tests pin the two invariants that make the loss impossible:
 
 1. The three stores take the shared process-wide lock for their write
    transactions, so their writes serialize against MessageStore/VectorStore.
-2. A lock collision inside a write transaction is retried with bounded backoff
-   instead of dropping the write.
+2. A colliding writer WAITS on that lock rather than racing into
+   busy_timeout expiry, so no write is dropped.
+
+There is no retry/backoff: the lock is held for the whole write transaction, so
+the loser blocks instead of failing. A future change that shortens the lock
+scope (or adds a real retry) must keep these tests green.
 
 Every store under test is built on a tmp_path database. No test touches a real
 trove.db.

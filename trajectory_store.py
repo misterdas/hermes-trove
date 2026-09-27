@@ -589,14 +589,11 @@ class TrajectoryStore:
         self._state_semantic_cache: (
             tuple[str, tuple[int, float], list[int], Any] | None
         ) = None
-        # Process-wide lock, not a per-instance one (t4 follow-up, 2026-09-27
-        # audit): this store holds its own connection on the same db_path as
-        # MessageStore/DAG, and every write here is BEGIN IMMEDIATE. With only
-        # an instance lock, a trajectory write colliding with the gateway's
-        # ingest waits out busy_timeout (30s) and then raises with the write
-        # lost. The shared lock serializes every store's write transaction
-        # in-process - the one thing SQLite's cross-process file locks cannot
-        # do for us. It is reentrant and is never held across a network call.
+        # Process-wide lock, not a per-instance one: this store holds its own
+        # connection on the same db_path, and every write here is BEGIN
+        # IMMEDIATE, so a colliding writer waits out busy_timeout and loses
+        # the write. Reentrant, never held across a network call. See
+        # process_write_lock.
         self._lock = process_write_lock(self.db_path)
         self._conn = self._open_connection()
         try:
