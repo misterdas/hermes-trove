@@ -823,6 +823,7 @@ def test_trove_doctor_command_payload_warning_drives_action_recommended(engine, 
             "suspicious_base64_like_rows": [{"store_id": 1, "chars": 24000}],
             "quarantined_assistant_rows": [],
             "suspicious_repetitive_assistant_rows": [],
+            "duplicate_tool_calls_rows": [],
             "heartbeat_noise_rows": [],
         }
 

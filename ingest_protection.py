@@ -2030,6 +2030,39 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         if len(generic_rows) >= limit:
             break
 
+    # Byte-identical tool_calls mean the same message was re-ingested: the
+    # call_id UUID is part of the blob, so a legitimate repeat can never match.
+    # The repetitive-assistant check above cannot see this -- it reads `content`
+    # only, and these rows carry a few hundred chars of prose with the bulk in
+    # tool_calls. Rank by wasted bytes, not row count: one 48x copy of a 10k
+    # blob is the context cost that matters.
+    duplicate_tool_calls_rows = [
+        {
+            "store_id": int(first_store_id),
+            "session_id": min_session_id,
+            "source": min_source,
+            "role": min_role,
+            "field": "tool_calls",
+            "length": int(blob_len or 0),
+            "tool_calls_len": int(blob_len or 0),
+            "occurrences": int(occurrences or 0),
+            "wasted_bytes": int(blob_len or 0) * (int(occurrences or 0) - 1),
+            "suspicious_category": "duplicate_tool_calls",
+        }
+        for first_store_id, min_session_id, min_source, min_role, blob_len, occurrences in conn.execute(
+            """
+            SELECT MIN(store_id), MIN(session_id), MIN(source), MIN(role), length(tool_calls), COUNT(*)
+            FROM messages
+            WHERE COALESCE(tool_calls, '') <> ''
+            GROUP BY tool_calls
+            HAVING COUNT(*) > 1
+            ORDER BY COUNT(*) * length(tool_calls) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    ]
+
     quarantined_assistant_rows = [
         make_row(row, field="content", length_key="content_len", category=_QUARANTINED_ASSISTANT_KIND)
         for row in conn.execute(
@@ -2119,6 +2152,7 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         "suspicious_base64_like_rows": generic_rows,
         "quarantined_assistant_rows": quarantined_assistant_rows,
         "suspicious_repetitive_assistant_rows": suspicious_repetitive_assistant_rows,
+        "duplicate_tool_calls_rows": duplicate_tool_calls_rows,
         "heartbeat_noise_rows": heartbeat_noise_rows,
     }
 
