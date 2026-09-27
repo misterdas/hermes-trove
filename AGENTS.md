@@ -83,7 +83,7 @@ keyword arm ran".
    recall quality matters, measure it, don't eyeball it.
 7. **CI contract:** `ruff check .` (rule set in `pyproject.toml`: E4/E7/E9/F, no E501,
    no isort — historical decision, don't reformat wholesale) on Python 3.11, pytest on
-   3.11 + 3.14, actionlint on workflows. Locally:
+   3.11 + 3.12 + 3.13 + 3.14, actionlint on workflows. Locally:
    ```bash
    python3.11 -m venv .venv-dev && .venv-dev/bin/pip install pytest numpy ruff==0.15.13
    # CI also stubs agent/context_engine.py — needed locally if importing engine directly

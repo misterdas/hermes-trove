@@ -44,12 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
-      # Run the bounds of the supported range (oldest runtime + newest).
-      # Middle versions (3.12/3.13) are re-added on demand when a
-      # version-specific issue appears — they add ~half the CI wall time
-      # with near-zero coverage value for a 3.11+ plugin.
+      # Full supported range. 3.11 is the floor and 3.14 the ceiling; the middle
+      # minors are listed explicitly because a plugin that only ever runs on the
+      # bounds has no coverage of the versions most hosts actually ship.
       matrix:
-        python-version: ["3.11", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
