@@ -17,7 +17,6 @@ from pathlib import Path
 import re
 import sqlite3
 import struct
-import threading
 import time
 from typing import Any, Callable, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote

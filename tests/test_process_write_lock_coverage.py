@@ -11,9 +11,7 @@ them. This test fails the moment a store regresses to a private RLock.
 from __future__ import annotations
 
 import threading
-import time
 
-import pytest
 
 from hermes_trove.assertion_store import AssertionStore
 from hermes_trove.dag import SummaryDAG
