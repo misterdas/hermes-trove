@@ -3032,11 +3032,24 @@ def _resolve_store_dim(config, provider_dim: int, override: int | None = None) -
     return store_dim
 
 
-def _count_inflight(conn: sqlite3.Connection) -> int:
+def _count_inflight(conn: sqlite3.Connection, identity_hash: str | None = None) -> int:
+    # Filter by identity like _count_vectors does. Without it this counts lease
+    # rows left behind by an ARCHIVED embedding profile: switching models
+    # (bge-base -> bge-small) orphans them under the old identity_hash, and the
+    # status report then shows in_flight: 64 while the backfill run, which does
+    # filter by identity, correctly reports 0. Dead rows for a retired model are
+    # not in-flight work.
     try:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM trove_embedding_backfill_inflight"
-        ).fetchone()
+        if identity_hash:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trove_embedding_backfill_inflight "
+                "WHERE identity_hash = ?",
+                (identity_hash,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trove_embedding_backfill_inflight"
+            ).fetchone()
         return int(row[0]) if row is not None else 0
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
@@ -3198,7 +3211,12 @@ def _embedding_status_text(engine) -> str:
                     f"expired {-remaining:.1f}s ago)"
                 )
 
-        in_flight = _count_inflight(read_conn)
+        # Count only the ACTIVE chunk profile: lease rows under an archived
+        # identity (left by a model switch) are dead markers, not in-flight work.
+        in_flight = _count_inflight(
+            read_conn,
+            str(chunk_profile["identity_hash"]) if chunk_profile is not None else None,
+        )
         lines.append(f"in_flight: {in_flight}")
 
         if summary_profile is not None:
