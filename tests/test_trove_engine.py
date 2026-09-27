@@ -27757,3 +27757,70 @@ class TestExtractionDuringCompress:
         result = eng.compress(messages)
         assert result[0]["role"] == "system"
         assert len(eng._dag.get_session_nodes("extract-fail")) > 0
+
+
+def test_failed_batch_append_schedules_cursor_reconcile(tmp_path, monkeypatch):
+    """A failed batch append must not leave a stale ingest cursor.
+
+    The cursor only advances after a successful write, so a failed append
+    left it pointing at the pre-batch position and the next turn re-sent the
+    whole session history from there — N-fold re-ingest from one transient
+    write failure. Marking the cursor for reconciliation makes the next
+    ingest rebuild it from the durable store.
+    """
+    db_path = tmp_path / "failed-append-reconcile.db"
+    config = TROVEConfig(database_path=str(db_path))
+    engine = TROVEEngine(config=config)
+    engine.on_session_start(
+        "failed-append-session",
+        platform="cli",
+        conversation_id="failed-append-conversation",
+        context_length=200000,
+    )
+    try:
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question one"},
+            {"role": "assistant", "content": "answer one"},
+        ]
+
+        def boom(*args, **kwargs):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        monkeypatch.setattr(
+            engine._store, "_append_protected_batch", boom, raising=True
+        )
+        # ingest() records the failure and returns rather than propagating it.
+        engine.ingest(messages)
+
+        # Cursor did not advance past the failed batch...
+        assert engine._ingest_cursor == 0
+        # ...and the next ingest knows to rebuild it from the store.
+        assert engine._ingest_cursor_needs_reconcile is True
+    finally:
+        engine.on_session_end(engine._session_id, [])
+
+
+def test_successful_batch_append_does_not_schedule_reconcile(tmp_path):
+    """Control for the guard above: the happy path must not reconcile."""
+    db_path = tmp_path / "ok-append-reconcile.db"
+    config = TROVEConfig(database_path=str(db_path))
+    engine = TROVEEngine(config=config)
+    engine.on_session_start(
+        "ok-append-session",
+        platform="cli",
+        conversation_id="ok-append-conversation",
+        context_length=200000,
+    )
+    try:
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question one"},
+            {"role": "assistant", "content": "answer one"},
+        ]
+        engine.ingest(messages)
+
+        assert engine._ingest_cursor == len(messages)
+        assert engine._ingest_cursor_needs_reconcile is False
+    finally:
+        engine.on_session_end(engine._session_id, [])

@@ -5101,13 +5101,25 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
-            self._session_id,
-            protected_messages,
-            estimates,
-            source=self._session_platform,
-            conversation_id=self._conversation_id,
-        )
+        try:
+            self._store._append_protected_batch(
+                self._session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=self._conversation_id,
+            )
+        except Exception:
+            # The cursor below only advances on success, so a failed batch
+            # leaves it pointing at the pre-batch position and the next turn
+            # re-sends the WHOLE history from there. That is how one transient
+            # write failure (corrupt index, lock timeout, brief I/O blip) turns
+            # into N-fold re-ingest of every message in the session. Mark the
+            # cursor for reconciliation instead: the next ingest rebuilds it
+            # from the durable store, so only genuinely-missing messages are
+            # re-sent. Same machinery the post-restart rebind already uses.
+            self._ingest_cursor_needs_reconcile = True
+            raise
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
