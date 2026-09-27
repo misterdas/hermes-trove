@@ -20,6 +20,7 @@ from .db_bootstrap import (
     configure_connection,
     ensure_temporal_rollup_tables,
     mark_migration_step_complete,
+    process_write_lock,
     refuse_schema_version_too_new,
     run_versioned_migrations,
     verify_temporal_rollup_schema,
@@ -58,6 +59,12 @@ class RollupStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
+        # Shared process-wide lock (2026-09-26 audit). RollupStore is constructed
+        # on the SAME db_path as MessageStore and holds its own connection, so
+        # the per-instance ``_write_lock`` cannot serialize a rollup claim
+        # against the gateway's ingest. Without this, busy_timeout expiry raises
+        # OperationalError and the claim row is silently lost.
+        self._process_lock = process_write_lock(self.db_path)
         self._init_db()
 
     def _init_db(self) -> None:
@@ -95,8 +102,18 @@ class RollupStore:
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
+        """Serialize a rollup write against every other connection on this file.
+
+        Takes the per-instance lock AND the process-wide lock, so a claim cannot
+        collide with MessageStore/VectorStore/SummaryDAG ingest in this process.
+        ``self._conn`` is the context manager here (NOT ``write_transaction``):
+        it commits/rolls back on exit, so the file's write lock is released before
+        the lock is dropped. Wrapping the repo's ``write_transaction`` instead
+        would leave a BEGIN IMMEDIATE open on clean exit and deadlock every other
+        writer on this file.
+        """
         try:
-            with self._write_lock, self._conn:
+            with self._write_lock, self._process_lock, self._conn:
                 yield
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):

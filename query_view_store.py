@@ -25,6 +25,7 @@ from .db_bootstrap import (
     SQLITE_BUSY_TIMEOUT_SECONDS,
     configure_connection,
     mark_migration_step_complete,
+    process_write_lock,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -540,6 +541,13 @@ class QueryViewStore:
             str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False
         )
         self._write_lock = threading.RLock()
+        # Shared process-wide lock (2026-09-26 audit). QueryViewStore is
+        # constructed on the SAME db_path as MessageStore and holds its own
+        # connection, so the per-instance ``_write_lock`` cannot serialize a
+        # view claim against the gateway's ingest. The savepoint reentrancy
+        # below is unchanged; the process lock is an RLock taken OUTSIDE it so
+        # nested transactions still work.
+        self._process_lock = process_write_lock(self.db_path)
         self._transaction_depth = 0
         try:
             refuse_schema_version_too_new(self._conn)
@@ -563,7 +571,11 @@ class QueryViewStore:
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
-        with self._write_lock:
+        # Lock ORDER matches MessageStore.write_guard, SummaryDAG.write_guard and
+        # RollupStore._write_transaction: per-instance lock FIRST, process-wide
+        # lock SECOND, always. Consistent order is what makes an AB-BA deadlock
+        # impossible between two stores writing the same trove.db.
+        with self._write_lock, self._process_lock:
             if self._conn is None:
                 raise RuntimeError("query-view store is closed")
             nested = self._transaction_depth > 0

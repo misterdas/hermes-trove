@@ -11,6 +11,7 @@ Depth semantics:
   D3+ — further condensation (weeks/months)
 """
 
+from contextlib import contextmanager
 import json
 import logging
 import sqlite3
@@ -27,6 +28,7 @@ from .db_bootstrap import (
     configure_connection,
     ensure_external_content_fts,
     is_fts_corruption_error,
+    process_write_lock,
     refuse_schema_version_too_new,
     repair_external_content_fts,
     run_versioned_migrations,
@@ -168,7 +170,27 @@ class SummaryDAG:
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.RLock()
+        # Shared process-wide lock (t4 follow-up, 2026-09-26 audit). The DAG is
+        # opened on the SAME db_path as MessageStore and VectorStore, and it
+        # holds its own independent connection. The per-instance ``_db_lock``
+        # above only guards this one connection, so a node insert could still
+        # collide with the gateway's ingest on the same WAL file. Taking the
+        # shared lock makes this connection's write transactions serialize
+        # against every other connection in the process, which is the only
+        # coordination SQLite's cross-process file locks cannot provide.
+        self._process_lock = process_write_lock(self.db_path)
         self._init_db()
+
+    @contextmanager
+    def write_guard(self):
+        """Serialize a write transaction against every other connection here.
+
+        Takes the per-instance ``_db_lock`` AND the process-wide lock for this
+        database path. Mirrors ``MessageStore.write_guard`` so all four
+        trove.db writers share one contract.
+        """
+        with self._db_lock, self._process_lock:
+            yield
 
     @property
     def connection(self) -> Optional[sqlite3.Connection]:
@@ -273,7 +295,7 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
-        with self._db_lock:
+        with self.write_guard():
             try:
                 return _insert_node()
             except sqlite3.DatabaseError as exc:
@@ -359,7 +381,7 @@ class SummaryDAG:
     ) -> int:
         deleted = 0
         while True:
-            with self._db_lock:
+            with self.write_guard():
                 try:
                     self._conn.execute("BEGIN IMMEDIATE")
                     node_ids = self.delete_node_batch(
@@ -414,7 +436,7 @@ class SummaryDAG:
         Used for /new carry-over where retained summaries should become part of
         the fresh session while preserving node IDs and node-to-node links.
         """
-        with self._db_lock:
+        with self.write_guard():
             cur = self._conn.execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
