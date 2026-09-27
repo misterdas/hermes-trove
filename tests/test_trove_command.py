@@ -1038,10 +1038,12 @@ def test_trove_help_on_unknown_subcommand(engine):
 def test_trove_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_trove_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `duplicate`, `duplicate apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply`" in result
     assert "/trove doctor clean apply" in result
     assert "/trove doctor clean lifecycle" in result
     assert "/trove doctor clean lifecycle apply" in result
+    assert "/trove doctor duplicate" in result
+    assert "/trove doctor duplicate apply" in result
     assert "/trove doctor repair" in result
     assert "/trove doctor repair apply" in result
     assert "/trove doctor source" in result
@@ -1851,3 +1853,97 @@ def test_register_allows_trove_slash_command_when_explicitly_enabled(tmp_path, m
 
     assert ctx.engine is not None
     assert "trove" in ctx.commands
+
+
+def _reingest(engine, session_id: str, role: str, content: str, times: int) -> None:
+    """Write the same message `times` times, as a re-ingest pass would.
+
+    Goes through the store directly: ``engine.ingest()`` advances the
+    cursor, so calling it repeatedly writes nothing after the first turn.
+    The duplicates this checks for come from a *failed* batch append
+    leaving the cursor stale, which replays the whole history.
+    """
+    for _ in range(times):
+        engine._store.append(session_id, {"role": role, "content": content})
+
+
+def test_trove_doctor_duplicate_reports_reingested_rows(tmp_path):
+    config = TROVEConfig(database_path=str(tmp_path / "trove_dup_check.db"))
+    engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine.on_session_start("dup-session", platform="cli", context_length=200000)
+    _reingest(engine, "dup-session", "user", "same message", 4)
+
+    result = handle_trove_command("doctor duplicate", engine)
+
+    assert "TROVE doctor duplicate" in result
+    assert "status: candidates-found" in result
+    assert "duplicate_clusters: 1" in result
+    assert "redundant_rows: 3" in result
+    assert "largest_cluster_extra: 3" in result
+    assert "no rows were deleted" in result
+    # read-only: re-running still sees the same count
+    assert "redundant_rows: 3" in handle_trove_command("doctor duplicate", engine)
+
+
+def test_trove_doctor_duplicate_clean_db_reports_ok(tmp_path):
+    config = TROVEConfig(database_path=str(tmp_path / "trove_dup_clean.db"))
+    engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine.on_session_start("clean-session", platform="cli", context_length=200000)
+    _reingest(engine, "clean-session", "user", "only one", 1)
+
+    result = handle_trove_command("doctor duplicate", engine)
+
+    assert "status: ok" in result
+    assert "redundant_rows: 0" in result
+    assert "nothing to clean" in result
+
+
+def test_trove_doctor_duplicate_apply_requires_opt_in(tmp_path):
+    config = TROVEConfig(database_path=str(tmp_path / "trove_dup_denied.db"))
+    engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine.on_session_start("dup-denied", platform="cli", context_length=200000)
+    _reingest(engine, "dup-denied", "user", "same message", 3)
+
+    result = handle_trove_command("doctor duplicate apply", engine)
+
+    assert "status: denied" in result
+    assert "disabled by default" in result
+    assert engine._lifecycle.connection.execute(
+        "SELECT COUNT(*) FROM messages"
+    ).fetchone()[0] == 3
+
+
+def test_trove_doctor_duplicate_apply_collapses_and_keeps_earliest(tmp_path):
+    config = TROVEConfig(
+        database_path=str(tmp_path / "trove_dup_apply.db"),
+        doctor_clean_apply_enabled=True,
+    )
+    engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine.on_session_start("dup-apply", platform="cli", context_length=200000)
+    _reingest(engine, "dup-apply", "user", "keep me", 6)
+    first_id = engine._lifecycle.connection.execute(
+        "SELECT MIN(store_id) FROM messages"
+    ).fetchone()[0]
+    # a genuinely distinct message must survive
+    _reingest(engine, "dup-apply", "user", "different", 1)
+
+    result = handle_trove_command("doctor duplicate apply", engine)
+
+    assert "status: ok" in result
+    assert "redundant_rows_removed: 5" in result
+    assert "duplicate_clusters_remaining: 0" in result
+    survivors = engine._lifecycle.connection.execute(
+        "SELECT content FROM messages ORDER BY store_id"
+    ).fetchall()
+    assert [r[0] for r in survivors] == ["keep me", "different"]
+    assert engine._lifecycle.connection.execute(
+        "SELECT MIN(store_id) FROM messages"
+    ).fetchone()[0] == first_id
+
+
+def test_trove_doctor_duplicate_help_lists_both_forms():
+    from hermes_trove.command import _help_text
+
+    text = _help_text()
+    assert "/trove doctor duplicate:" in text
+    assert "/trove doctor duplicate apply:" in text

@@ -49,6 +49,46 @@ These bugs have been identified and fixed in the upstream repo but may persist i
 
 - **SQLite directory ownership check (`sqlite_util.py`)**: `_open_private_sqlite_directory` verifies `st_uid == os.getuid()` (not `st_mode & 0o022`). A shell umask of `0002` creates group-writable `0o775` dirs, which the old mode-bit check falsely rejected. Always check directory OWNER, not mode bits.
 - **Low-FD pytest**: CI runs `ulimit -n 1024; python -m pytest tests/ -q`. If tests fail under low FD, check `sqlite_util.py` ownership logic and temp-directory permissions — `tmp_path` + `Path.mkdir()` with umask `0002` triggers the old `0o022` check.
+- **ERROR count ≠ failure count**: a large `ERROR` block in pytest output is often unconfigured test dependencies (no embedding provider, missing numpy, absent fastembed) rather than real failures caused by a code change. On one run, 250 tests reported `ERROR` (all embedding/vector tests) alongside a single `FAIL` caused by the change itself. Separate the two: `FAIL` = assertion/exception inside a test body — investigate the change first; `ERROR` = the test could not start (imports failed, fixture unavailable, env gap). Scan the tail — if most ERROR lines share one missing dependency, the change is probably fine and the env needs setup; if ERROR lines are mixed with FAIL lines near the changed files, drill into those specifically before widening.
+
+### Migration-step placement: gate on table existence
+
+When adding a new migration step that operates on a specific table (e.g. `messages`, `summary_nodes`), **do not place the step in `run_versioned_migrations` unguarded** — that function runs on every store open and a fresh DB has no tables yet, so a `no such table` OperationalError will hit before the table DDL lands. Instead, place the step inside the existing migration function that already gates on that table's columns (e.g. `run_message_identity_migration` gates on `observed_at`/`ingested_at` presence via `PRAGMA table_info(messages)`). Same pattern for any new table: find the existing `ensure_*` / marker function that already references it and extend that, or gate your new step on `PRAGMA table_info(<table>)` yourself.
+
+The error you will see if you get this wrong:
+
+```
+sqlite3.OperationalError: no such table: main.messages
+```
+
+at the line where your migration step calls `conn.execute(...)` on the table.
+
+### Duplicate message rows: the cursor must advance only on success
+
+`_ingest_cursor` is process-local and marks how much of the in-memory message
+list is already persisted. It is set **after** `_append_protected_batch`
+returns. If that call raises, the cursor stays at the pre-batch position, so
+the next turn re-sends the whole session history and every already-persisted
+message is written again under a fresh `store_id`. One transient write
+failure (corrupt index, lock timeout, brief I/O blip) becomes N-fold
+re-ingest — 19 failures produced 8 copies of one message.
+
+The unique `idx_msg_identity` index cannot catch this: `observed_at` is NULL
+for ~75% of rows (the host supplies no message timestamp) and SQLite treats
+NULLs as distinct, so re-copies never collide. Backstamping NULL
+`observed_at` from `ingested_at` does not help either — it gives the same
+message N distinct timestamps and still looks like N unique rows.
+
+Two consequences when working here:
+- Any new write to `messages` must be inside the same try that sets
+  `_ingest_cursor`, and failure must set `_ingest_cursor_needs_reconcile`
+  (reusing `_reconcile_ingest_cursor_from_store`, the post-restart path).
+- Counting or deduping duplicates must fold NULL `observed_at` with
+  `COALESCE(observed_at, -1)`. A plain column list gives every NULL its own
+  cluster and reports near-zero. `dedup_message_identity_clusters` in
+  `db_bootstrap.py` deliberately skips NULL-`observed_at` rows and refuses
+  when chunk references dangle — that is why `/trove doctor duplicate apply`
+  exists as a separate check that re-points chunk refs first.
 
 ### Upstream open issues (monitor before upgrading)
 

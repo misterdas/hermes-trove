@@ -12,6 +12,29 @@ Use read-only product tools before changing configuration or running an apply pa
 
 If optional slash commands are enabled, `/trove status` and `/trove doctor` expose the corresponding operator views. To enable: set `TROVE_ENABLE_SLASH_COMMAND=1` in the environment. Without it, the `/trove` slash commands are silently not registered.
 
+### Duplicate message rows
+
+`/trove doctor duplicate` counts re-ingested rows: identical message content
+persisted more than once under different `store_id` values. It is read-only
+and reports `duplicate_clusters`, `redundant_rows` (the removable count), and
+`largest_cluster_extra`.
+
+`/trove doctor duplicate apply` collapses them, keeping the **earliest**
+`store_id` of each cluster. It re-points `trove_chunk_meta` rows onto the
+survivor *before* deleting, so recall keeps working, and takes a backup first.
+Gated by `TROVE_DOCTOR_CLEAN_APPLY_ENABLED=true` (same gate as
+`/trove doctor clean apply`).
+
+These rows come from an ingest failure that left `_ingest_cursor` at its
+pre-batch position, so the next turn re-sent the whole history. The unique
+identity index cannot catch it: `observed_at` is NULL for most rows (the host
+supplies no message timestamp) and SQLite treats NULLs as distinct, so the
+re-copies never collide. Counting therefore folds NULL `observed_at` together
+with `COALESCE(observed_at, -1)`.
+
+Same work offline, without a bound session:
+`python3 scripts/dedup_messages.py --db ~/.hermes/trove.db [--apply] [--vacuum]`.
+
 ## Safe mutation order
 
 For cleanup, repair, source normalization, or rotate:

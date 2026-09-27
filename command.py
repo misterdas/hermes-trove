@@ -475,6 +475,8 @@ def _help_text(error: str | None = None) -> str:
         "- /trove doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
         "- /trove doctor clean lifecycle: read-only scan for lifecycle rows with zero messages/nodes",
         "- /trove doctor clean lifecycle apply: backup-first cleanup of empty lifecycle rows only",
+        "- /trove doctor duplicate: read-only count of re-ingested duplicate message rows (identical content saved more than once)",
+        "- /trove doctor duplicate apply: backup-first collapse of duplicate message rows, keeping the earliest of each cluster (needs TROVE_DOCTOR_CLEAN_APPLY_ENABLED=true)",
         "- /trove doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /trove doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
         "- /trove doctor repair schema-stamp: read-only scan for an interim-build schema_version stamp ahead of the actual v5 shape",
@@ -2482,6 +2484,160 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
         f"backup_path: {backup['backup_path']}",
         f"backup_size_bytes: {backup['backup_size']}",
         "note: only empty lifecycle rows were deleted — messages and nodes untouched",
+    ])
+
+
+def _message_duplicate_stats(engine) -> dict:
+    """Count re-ingested duplicate message rows (read-only).
+
+    Groups by message identity with NULL ``observed_at`` folded together
+    (COALESCE -1): a plain column list would give every NULL its own
+    cluster, because SQLite treats NULLs as distinct. That folding is
+    what makes this check see the bulk of them — ``observed_at`` is NULL
+    for ~75% of rows, since the host supplies no message timestamp.
+    """
+    conn = engine._lifecycle.connection
+    rows = conn.execute(
+        """
+        SELECT COUNT(*), COALESCE(SUM(n - 1), 0), COALESCE(MAX(n - 1), 0)
+        FROM (
+            SELECT COUNT(*) AS n
+            FROM messages
+            GROUP BY session_id, role, COALESCE(observed_at, -1),
+                     COALESCE(tool_call_id, ''), COALESCE(content, ''),
+                     COALESCE(tool_calls, '')
+            HAVING n > 1
+        )
+        """
+    ).fetchone()
+    clusters, redundant, largest = int(rows[0]), int(rows[1]), int(rows[2])
+    return {
+        "clusters": clusters,
+        "redundant": redundant,
+        "largest": largest,
+        "total": int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]),
+    }
+
+
+def _doctor_duplicate_text(engine) -> str:
+    stats = _message_duplicate_stats(engine)
+    lines = [
+        "TROVE doctor duplicate",
+        f"status: {'candidates-found' if stats['redundant'] else 'ok'}",
+        f"messages_total: {stats['total']}",
+        f"duplicate_clusters: {stats['clusters']}",
+        f"redundant_rows: {stats['redundant']}",
+        f"largest_cluster_extra: {stats['largest']}",
+    ]
+    if not stats["redundant"]:
+        lines.append("note: no duplicate message rows — nothing to clean")
+        return "\n".join(lines)
+    lines.extend([
+        "note: read-only scan — no rows were deleted",
+        "note: identical content re-ingested under a new store_id; the earliest row of each cluster is kept",
+        "note: use `/trove doctor duplicate apply` to collapse them",
+    ])
+    return "\n".join(lines)
+
+
+def _doctor_duplicate_apply_text(engine) -> str:
+    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
+        return "\n".join([
+            "TROVE doctor duplicate apply",
+            "status: denied",
+            "error: destructive cleanup is disabled by default",
+            "note: set TROVE_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+
+    before = _message_duplicate_stats(engine)
+    if not before["redundant"]:
+        return "\n".join([
+            "TROVE doctor duplicate apply",
+            "status: ok",
+            "note: no duplicate message rows — nothing to do",
+        ])
+
+    backup = backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "TROVE doctor duplicate apply",
+            "status: error",
+            "error: failed to create backup before destructive cleanup",
+            f"database_path: {backup['db_path']}",
+            f"backup_error: {backup['error']}",
+            "note: no rows were deleted",
+        ])
+
+    conn = engine._lifecycle.connection
+    # Chunk references must follow their row to the surviving earliest copy
+    # BEFORE the delete, or recall loses them. chunk_id derives from
+    # identity_hash (not store_id), so only store_id moves.
+    has_chunks = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trove_chunk_meta'"
+    ).fetchone() is not None
+    if has_chunks:
+        conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
+        conn.execute(
+            """
+            CREATE TEMP TABLE trove_dedup_map AS
+            SELECT store_id AS victim, keep AS keeper FROM (
+                SELECT store_id,
+                       MIN(store_id) OVER (PARTITION BY session_id, role,
+                           COALESCE(observed_at, -1), COALESCE(tool_call_id, ''),
+                           COALESCE(content, ''), COALESCE(tool_calls, '')) AS keep,
+                       ROW_NUMBER() OVER (PARTITION BY session_id, role,
+                           COALESCE(observed_at, -1), COALESCE(tool_call_id, ''),
+                           COALESCE(content, ''), COALESCE(tool_calls, '')
+                           ORDER BY store_id) AS rn
+                FROM messages
+            ) WHERE rn > 1
+            """
+        )
+        repointed = conn.execute(
+            """
+            UPDATE trove_chunk_meta
+            SET store_id = (SELECT d.keeper FROM trove_dedup_map d
+                            WHERE d.victim = trove_chunk_meta.store_id)
+            WHERE store_id IN (SELECT victim FROM trove_dedup_map)
+            """
+        ).rowcount
+        conn.execute(
+            "DELETE FROM messages WHERE store_id IN (SELECT victim FROM trove_dedup_map)"
+        )
+    else:
+        repointed = 0
+        conn.execute(
+            """
+            DELETE FROM messages WHERE store_id NOT IN (
+                SELECT MIN(store_id) FROM messages
+                GROUP BY session_id, role, COALESCE(observed_at, -1),
+                         COALESCE(tool_call_id, ''), COALESCE(content, ''),
+                         COALESCE(tool_calls, '')
+            )
+            """
+        )
+    conn.commit()
+
+    after = _message_duplicate_stats(engine)
+    orphans = 0
+    if has_chunks:
+        orphans = conn.execute(
+            "SELECT COUNT(*) FROM trove_chunk_meta c LEFT JOIN messages m "
+            "ON m.store_id = c.store_id WHERE m.store_id IS NULL"
+        ).fetchone()[0]
+    return "\n".join([
+        "TROVE doctor duplicate apply",
+        "status: ok",
+        f"messages_before: {before['total']}",
+        f"redundant_rows_removed: {before['redundant'] - after['redundant']}",
+        f"messages_after: {after['total']}",
+        f"duplicate_clusters_remaining: {after['clusters']}",
+        f"chunk_refs_repointed: {repointed}",
+        f"orphan_chunk_refs: {orphans}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size_bytes: {backup['backup_size']}",
+        "note: the earliest row of each cluster was kept; content is identical across a cluster",
     ])
 
 
@@ -5689,6 +5845,10 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
             return _doctor_clean_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle":
             return _doctor_clean_lifecycle_text(engine)
+        if len(rest) == 2 and rest[0].lower() == "duplicate" and rest[1].lower() == "apply":
+            return _doctor_duplicate_apply_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "duplicate":
+            return _doctor_duplicate_text(engine)
         if len(rest) == 3 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle" and rest[2].lower() == "apply":
             return _doctor_clean_lifecycle_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
@@ -5704,7 +5864,7 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
             return _doctor_repair_schema_stamp_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
             return _doctor_source_apply_text(engine)
-        return _help_text("`/trove doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply` as extra subcommands.")
+        return _help_text("`/trove doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `duplicate`, `duplicate apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply` as extra subcommands.")
 
     if head == "backup":
         if rest:
