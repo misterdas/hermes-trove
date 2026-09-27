@@ -60,7 +60,6 @@ from .search_query import (
 from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
     _prepare_private_sqlite_file,
-    _remove_stale_shm_sidecar,
     _temporary_sqlite_busy_timeout,
     startup_index_self_heal,
 )
@@ -150,10 +149,10 @@ def _prepare_private_sqlite_storage(db_path: Path) -> None:
     else:
         _restrict_created_sqlite_directory(db_path.parent)
 
-    # t3: drop a stale -shm sidecar before SQLite attaches to it. The -shm is
-    # derived WAL-index state; when -wal is missing/empty it indexes nothing
-    # and only risks confusing the next opener's shm attach.
-    _remove_stale_shm_sidecar(db_path)
+    # Deliberately no sidecar cleanup here. SQLite rebuilds a stale -shm
+    # itself (verified against garbage, 0-byte-wal, and foreign-shm cases),
+    # while unlinking one under a live sibling — the t3 split-brain — is the
+    # thing this module exists to avoid.
     _prepare_private_sqlite_file(db_path)
 
 

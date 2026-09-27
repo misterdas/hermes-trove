@@ -1,4 +1,4 @@
-"""Tests for the startup index self-heal, stale -shm cleanup, and transient
+"""Tests for the startup index self-heal and transient
 ingest retry (multi-process WAL split-brain hardening, Sep 2026).
 
 Production fault being covered: ``sqlite_autoindex_metadata_1`` loses a row
@@ -10,16 +10,14 @@ REINDEX on open — never rename or move the database file.
 
 from __future__ import annotations
 
-import os
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from hermes_trove.sqlite_util import (
     _is_index_corruption_detail,
-    _remove_stale_shm_sidecar,
     startup_index_self_heal,
 )
+from hermes_trove.store import _prepare_private_sqlite_storage
 
 
 PROD_DETAILS = [
@@ -94,78 +92,47 @@ class TestStartupIndexSelfHeal:
         assert conn.reindex_calls == 0
 
 
-class TestStaleShmCleanup:
-    def _shm(self, db: Path) -> Path:
-        return db.with_name(db.name + "-shm")
+class TestOpenNeverUnlinksSidecars:
+    """Opening a store must not unlink a sibling's ``-shm``.
 
-    def _wal(self, db: Path) -> Path:
-        return db.with_name(db.name + "-wal")
+    A t3 "stale shm cleanup" used to do exactly that before every open, and
+    unlinking the shared WAL-index region under a live sibling *is* the
+    split-brain it was meant to cure. It was removed: SQLite rebuilds a stale
+    ``-shm`` itself, so the delete bought nothing and cost a WAL. These pin
+    the removal — re-adding an unlink here fails the first test.
+    """
 
-    def test_removes_shm_when_wal_absent(self, tmp_path: Path):
+    def _wal_db(self, tmp_path: Path) -> Path:
         db = tmp_path / "t.db"
-        db.write_bytes(b"SQLite format 3\x00")
-        self._shm(db).write_bytes(b"x" * 32768)
-        assert _remove_stale_shm_sidecar(db) is True
-        assert not self._shm(db).exists()
-
-    def test_noop_when_no_shm(self, tmp_path: Path):
-        db = tmp_path / "t.db"
-        db.write_bytes(b"SQLite format 3\x00")
-        assert _remove_stale_shm_sidecar(db) is False
-
-    def test_keeps_shm_when_wal_nonempty(self, tmp_path: Path):
-        db = tmp_path / "t.db"
-        db.write_bytes(b"SQLite format 3\x00")
-        self._shm(db).write_bytes(b"x" * 32768)
-        self._wal(db).write_bytes(b"y" * 100)
-        assert _remove_stale_shm_sidecar(db) is False
-        assert self._shm(db).exists()
-
-    def test_removes_shm_when_wal_empty(self, tmp_path: Path):
-        db = tmp_path / "t.db"
-        db.write_bytes(b"SQLite format 3\x00")
-        self._shm(db).write_bytes(b"x" * 32768)
-        self._wal(db).write_bytes(b"")
-        assert _remove_stale_shm_sidecar(db) is True
-        assert not self._shm(db).exists()
-
-    def test_keeps_shm_when_this_process_holds_it_open(self, tmp_path: Path):
-        # Regression for the 2026-09-23 split-brain: a same-process sibling
-        # connection (MessageStore/SummaryDAG/LifecycleStateStore) holds the
-        # shm open even when the wal is empty. Cleanup must not unlink it.
-        import sqlite3 as _sq
-
-        db = tmp_path / "t.db"
-        conn = _sq.connect(str(db))
+        conn = sqlite3.connect(db)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE t(x)")
+        conn.executemany("INSERT INTO t VALUES(?)", [(i,) for i in range(20)])
         conn.commit()
-        # Force a checkpoint so -wal is empty while -shm stays attached.
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        assert self._shm(db).exists()
-        assert _remove_stale_shm_sidecar(db) is False
-        assert self._shm(db).exists()
         conn.close()
+        return db
 
-    def test_keeps_shm_when_other_process_holds_it_open(self, tmp_path: Path):
-        # Cross-process sibling: an open fd anywhere in /proc keeps the shm.
-        db = tmp_path / "t.db"
-        db.write_bytes(b"SQLite format 3\x00")
-        shm = self._shm(db)
-        shm.write_bytes(b"x" * 32768)
-        self._wal(db).write_bytes(b"")
-        shm_fd = os.open(str(shm), os.O_RDONLY)
-        holder = subprocess.Popen(["sleep", "30"], pass_fds=(shm_fd,))
-        os.close(shm_fd)  # parent's copy must close: only the child should hold it
-        try:
-            assert _remove_stale_shm_sidecar(db) is False
-            assert shm.exists()
-        finally:
-            holder.terminate()
-            holder.wait()
-        # After the holder exits, the sidecar is provably orphaned again.
-        assert _remove_stale_shm_sidecar(db) is True
-        assert not shm.exists()
+    def test_prepare_storage_leaves_shm_alone(self, tmp_path: Path):
+        db = self._wal_db(tmp_path)
+        shm = db.with_name(db.name + "-shm")
+        shm.write_bytes(b"\x00" * 32768)  # stale region, no -wal on disk
+        _prepare_private_sqlite_storage(db)
+        assert shm.exists(), "open unlinked a sibling's -shm (t3 split-brain)"
+
+    def test_sqlite_rebuilds_stale_shm_without_help(self, tmp_path: Path):
+        db = self._wal_db(tmp_path)
+        shm = db.with_name(db.name + "-shm")
+        shm.write_bytes(b"\x00" * 32768)
+        db.with_name(db.name + "-wal").write_bytes(b"")  # 0-byte wal boundary
+        conn = sqlite3.connect(db, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("INSERT INTO t VALUES(999)")
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 21
+        conn.close()
+        check = sqlite3.connect(db)
+        assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        check.close()
 
 
 class TestRetryWorthyIngestError:
