@@ -4,6 +4,19 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Fixed
+
+- **Unbounded re-ingest growth**: a host that replays its message history after a restart re-sent every stored row on every turn. The reconcile cursor advanced only on a *front-anchored ordered* match, which an interleaved replay never produces, so a restarted session re-appended its entire history each turn — 23,436 rows for a single session, growing ~1,000 per turn. `reconcile.py` now also reconciles with an **order-blind membership cursor**: durable membership in stored history is matched as a multiset (with a surplus-repeat proof) and skipped. Verified on a live session: 536-row replay window reconciles to cursor 520, adding 16 rows instead of 536.
+- `/trove doctor duplicate apply` repoints `summary_nodes.source_ids` when it collapses rows, so rollup nodes keep referencing surviving rows instead of pointing at deleted `store_id`s.
+
+### Added
+
+- **Front-anchored ordered cursor** (`reconcile.py`): handles the replay shape membership cannot see, when the window starts at the head of stored history. Gated on an ordered-repeat proof, because a front match alone is not evidence of a replay — stored history can legitimately open with what the host just sent, and skipping there would drop the new rows behind it.
+- `idx_msg_identity_ts_fallback` (`db_bootstrap.py`): `idx_msg_identity` keys on `observed_at` raw and SQLite treats NULLs as distinct in a UNIQUE index, so a row with `observed_at IS NULL` opted out of uniqueness entirely. Folds a missing `observed_at` onto `ingested_at` so those rows still participate. Partial (`WHERE observed_at IS NULL`) so it never competes with the primary index, and a passive migration retry rather than a delete. Only catches a re-send **within the same second** — a cheap extra net, not the re-ingest fix.
+- **`/trove doctor duplicate [apply]`** (`command.py`): the operator tool that collapses re-ingested rows and re-points chunk references, so existing damage is cleaned without waiting for the ingest loop to stop. Read-only by default; `apply` is denied unless `TROVE_DOCTOR_CLEAN_APPLY_ENABLED=true`. Conservative by design — a repeat shorter than 5 consecutive rows is treated as legitimate and kept.
+
+Full suite: 3390 passed, 2 skipped, 12 xfailed. ruff clean.
+
 ## v1.2.2 - 2026-09-26
 
 ### Fixed
