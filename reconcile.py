@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1066,6 +1067,122 @@ class ReconcileMixin:
             return False
         return _tagless_identities(stored_head)[: len(tagless_incoming)] == tagless_incoming
 
+    @staticmethod
+    def _stored_head_contains_surplus_repeat(
+        stored_visible: List[tuple[str, str, str, str]],
+        prefix: List[tuple[str, str, str, str]],
+        min_surplus: int = 3,
+    ) -> bool:
+        """True when stored history holds more copies of ``prefix`` than once.
+
+        Proof of re-ingest that does not depend on order.  A contiguous-run
+        check can only see a block re-send; real re-ingest interleaves, so the
+        new rows land between the originals and no run of consecutive
+        identities repeats even though the rows are plainly duplicated.
+        Counting copies is order-blind and still cannot be produced by a
+        healthy conversation of this length.
+        """
+        if not prefix:
+            return False
+        stored_counts = Counter(stored_visible)
+        surplus = sum(
+            stored_counts[identity] - 1 for identity in set(prefix)
+        )
+        return surplus >= min_surplus
+
+    def _membership_cursor_for_store_head(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_all_rows: List[Dict[str, Any]],
+    ) -> int | None:
+        """Cursor from a one-for-one MEMBERSHIP match against stored history.
+
+        Returns how many leading ``messages`` are already stored, or ``None``
+        when nothing can be trusted.  This is the only matcher that works
+        against a re-ingested store.
+
+        Why the ordered matchers cannot: duplicate rows land *interleaved* with
+        the originals rather than appended as a block, so the replay window is
+        neither a suffix nor a prefix of stored history and a forward-only
+        monotonic match extends zero rows.  The tail matcher then walks its
+        candidate cursor down and settles on 1, re-ingesting nearly the whole
+        window on every restart -- a self-feeding loop (measured: one session
+        grew to 7,542 rows for a 70-message conversation).
+
+        Membership ignores order entirely: ``incoming[i]`` is skipped only when
+        an unconsumed stored copy of that exact identity exists.  Every skipped
+        row is therefore VERIFIED present, so the boundary can only be too
+        early (re-ingest a few rows) -- it can never drop a new message.
+
+        The cost is that it cannot tell a genuine repeat ("ok" sent twice with
+        no surplus stored copy) from a re-send, and under-counts it.  That
+        errs toward re-ingesting, the safe direction.
+        """
+        if not messages or not stored_all_rows:
+            return None
+
+        # Raw replay identity cannot see persisted-output recovery, so this
+        # matcher must not claim a prefix containing one; the paths with full
+        # proofs own that case.
+        for msg in messages:
+            if str(msg.get("role") or "") == "tool" and _is_hermes_persisted_output_marker(
+                normalize_content_value(msg.get("content")) or ""
+            ):
+                return None
+
+        def _tagless(msg: Dict[str, Any], stored_row: bool) -> tuple[str, str, str, str]:
+            role, content, tool_calls, tool_call_id = self._message_replay_identity(
+                msg, stored_row=stored_row,
+            )
+            return (role, _strip_replay_identity_shape_tag(content), tool_calls, tool_call_id)
+
+        def _incoming_identity(msg: Dict[str, Any]) -> tuple[str, str, str, str] | None:
+            if self._is_replayed_context_scaffold_message(msg):
+                return None
+            if self._matches_ignore_message_patterns(msg):
+                return None
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            if self._is_volatile_ignored_quarantine_placeholder(msg, text):
+                return None
+            if self._is_ignored_active_replay_placeholder(msg, text):
+                return None
+            return _tagless(msg, stored_row=False)
+
+        # Ignore-filtered history must not manufacture skip evidence, so it
+        # never enters the pool.
+        stored_visible = [
+            _tagless(row, stored_row=True)
+            for row in stored_all_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        if not stored_visible:
+            return None
+
+        available: Counter = Counter(stored_visible)
+        cursor = 0
+        matched: List[tuple[str, str, str, str]] = []
+        for msg in messages:
+            identity = _incoming_identity(msg)
+            if identity is None:
+                # Synthetic/filtered message: carries no durable row, so it
+                # must not consume a stored slot.
+                continue
+            if available[identity] <= 0:
+                break
+            available[identity] -= 1
+            matched.append(identity)
+            cursor += 1
+        if not cursor:
+            return None
+
+        # A membership match ALONE is not proof of a replay -- stored history
+        # can legitimately contain the same messages the host just sent.  The
+        # surplus proof can only pass on a store that is already demonstrably
+        # re-ingesting, never on a healthy one.
+        if not self._stored_head_contains_surplus_repeat(stored_visible, matched):
+            return None
+        return cursor
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
@@ -1110,6 +1227,45 @@ class ReconcileMixin:
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
+
+        # Re-ingest safe path: an order-blind, one-for-one MEMBERSHIP match
+        # against stored history.  It runs BEFORE the tail matcher because
+        # that matcher walks its candidate cursor down from len(messages) and
+        # will happily settle on a boundary of 1, re-ingesting almost the
+        # whole window again on the next turn.  That is the loop: the store
+        # keeps growing, the suffix never lines up, and the cursor never gets
+        # past the first message.
+        #
+        # It needs the WHOLE store, not a window sized off the incoming
+        # length: tail_limit scales with len(messages), so a short live window
+        # against a long re-ingested store looks only at the last few hundred
+        # rows while the rows it must match sit far earlier.  Sized off the
+        # store it sees them all, and the match stays O(n) over identities.
+        #
+        # Self-gating: the surplus proof can only pass on a store that is
+        # already demonstrably re-ingesting.  On a healthy store it returns
+        # None and every check below runs exactly as before.
+        membership_cursor = self._membership_cursor_for_store_head(
+            messages,
+            self._store.get_session_messages(self._session_id, limit=session_count),
+        )
+        if membership_cursor is not None and membership_cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed durable stored membership",
+                cursor=membership_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_rows),
+                effective_incoming=len(self._effective_replay_identities(messages)),
+            )
+            logger.debug(
+                "TROVE reconciled ingest cursor from stored membership: session=%s "
+                "cursor=%d incoming=%d session_count=%d",
+                self._session_id, membership_cursor, len(messages), session_count,
+            )
+            return membership_cursor
+
         stored_tail_rows = [
             row
             for row in stored_rows
