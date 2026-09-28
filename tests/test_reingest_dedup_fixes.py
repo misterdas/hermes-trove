@@ -13,6 +13,7 @@ Three fixes are covered:
 3. ``command._message_duplicate_cleanup_rows`` -- the doctor apply must catch
    timestamp-less duplicates while leaving legitimate short repeats alone.
 """
+import json
 import pathlib
 import sqlite3
 import sys
@@ -305,6 +306,96 @@ def _dup_conn(rows):
 def _cleanup_rows(conn):
     ns = _load_command_symbols()
     return ns["_message_duplicate_cleanup_rows"](conn)
+
+
+def _node_conn(rows, source_ids):
+    """_dup_conn plus a summary_nodes table holding one node."""
+    conn = _dup_conn(rows)
+    conn.execute(
+        """CREATE TABLE summary_nodes (
+            node_id INTEGER PRIMARY KEY, session_id TEXT, depth INTEGER,
+            summary TEXT, source_ids TEXT, source_type TEXT)"""
+    )
+    conn.execute(
+        "INSERT INTO summary_nodes (node_id, session_id, depth, summary, "
+        "source_ids, source_type) VALUES (1, 's', 0, 'sum', ?, 'messages')",
+        (json.dumps(source_ids),),
+    )
+    return conn
+
+
+def _repoint(conn, pairs):
+    src = pathlib.Path(__file__).resolve().parents[1] / "command.py"
+    text = src.read_text()
+    start = text.index("def _repoint_summary_node_source_ids(")
+    end = text.index("def _dangling_non_repointable_refs(")
+    ns: dict = {"json": json}
+    exec(compile(text[start:end], "<command-extract>", "exec"), ns)
+    conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
+    conn.execute(
+        "CREATE TEMP TABLE trove_dedup_map (victim INTEGER PRIMARY KEY, keeper INTEGER)"
+    )
+    conn.executemany("INSERT INTO temp.trove_dedup_map VALUES (?, ?)", pairs)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(summary_nodes)")}
+    moved = ns["_repoint_summary_node_source_ids"](conn, cols)
+    conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
+    return moved
+
+
+def test_repoint_moves_summary_refs_off_victims():
+    """A summary node citing a re-ingested row must follow it to the keeper.
+
+    Without this the apply refuses the whole cleanup: 191 refs on two nodes
+    blocked 21,295 rows on the live DB, every one with a surviving keeper.
+    Rows 1-10 are the originals; 11-20 are the re-ingest, so those are victims.
+    """
+    conversation = [("s", "user", f"m{i}", None) for i in range(10)]
+    conn = _node_conn(conversation + conversation, [1, 11, 12, 20])
+    pairs = _cleanup_rows(conn)
+    victims = {v for v, _ in pairs}
+    assert 11 in victims  # fixture sanity: the re-ingest rows are the victims
+    moved = _repoint(conn, pairs)
+    after = json.loads(
+        conn.execute("SELECT source_ids FROM summary_nodes WHERE node_id=1").fetchone()[0]
+    )
+    assert moved == 3
+    assert not (set(after) & victims)
+    assert len(after) == 4  # no source lost
+
+
+def test_repoint_preserves_unrelated_source_ids():
+    """Only ids in the dedup map move; everything else is byte-identical."""
+    conversation = [("s", "user", f"m{i}", None) for i in range(10)]
+    conn = _node_conn(conversation + conversation, [999, 1, 11, 888])
+    pairs = _cleanup_rows(conn)
+    _repoint(conn, pairs)
+    after = json.loads(
+        conn.execute("SELECT source_ids FROM summary_nodes WHERE node_id=1").fetchone()[0]
+    )
+    assert after[0] == 999 and after[3] == 888
+    assert after[1] == 1
+    assert after[2] == 1  # victim 11 -> its keeper
+
+
+def test_repoint_target_has_identical_content():
+    """A repointed ref must land on byte-identical content, or it is data loss."""
+    conversation = [("s", "assistant", f"payload{i}", None) for i in range(8)]
+    conn = _node_conn(conversation + conversation, [9])
+    pairs = _cleanup_rows(conn)
+    victim, keeper = next((v, k) for v, k in pairs if v == 9)
+    _repoint(conn, pairs)
+    after = json.loads(
+        conn.execute("SELECT source_ids FROM summary_nodes WHERE node_id=1").fetchone()[0]
+    )
+    assert after == [keeper]
+    a = conn.execute("SELECT content FROM messages WHERE store_id=?", (victim,)).fetchone()[0]
+    b = conn.execute("SELECT content FROM messages WHERE store_id=?", (keeper,)).fetchone()[0]
+    assert a == b
+
+
+def test_repoint_is_noop_without_dedup_map():
+    conn = _node_conn([("s", "user", "x", None)], [1])
+    assert _repoint(conn, []) == 0
 
 
 def test_cleanup_removes_ordered_replay_with_null_timestamps():

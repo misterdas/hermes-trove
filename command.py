@@ -2716,8 +2716,32 @@ def _doctor_duplicate_apply_text(engine) -> str:
             SET store_id = (SELECT d.keeper FROM temp.trove_dedup_map d
                             WHERE d.victim = trove_chunk_meta.store_id)
             WHERE store_id IN (SELECT victim FROM temp.trove_dedup_map)
-            """
+            """,
         ).rowcount
+
+    # Summary-node source_ids are the same pointer move as chunk refs: the
+    # content of a cluster is byte-identical, so repointing each victim to its
+    # keeper keeps the node's provenance intact instead of losing a source.
+    # Without this the apply refuses on any store where a summary node was
+    # built from messages that later got re-ingested -- measured on the live DB,
+    # 191 of 21,295 rows blocked the whole cleanup for two nodes, every one of
+    # them with a surviving keeper.
+    #
+    # Only IDs in the map move, so a node's other sources are untouched.  Two
+    # victims can collapse onto one keeper when a cluster holds >2 copies; the
+    # node then cites the same store_id twice, which is accurate (both rows had
+    # identical content) and costs nothing.
+    summary_refs_repointed = 0
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone():
+        has_nodes = {
+            r[1] for r in conn.execute("PRAGMA table_info(summary_nodes)")
+        }
+        if "source_ids" in has_nodes:
+            summary_refs_repointed = _repoint_summary_node_source_ids(
+                conn, has_nodes,
+            )
 
     # Refuse (before deleting anything) if an unrepointable reference targets a
     # victim.  Raising leaves the transaction to the caller's rollback, so the
@@ -2757,12 +2781,67 @@ def _doctor_duplicate_apply_text(engine) -> str:
         f"duplicate_clusters_remaining: {after['clusters']}",
         f"replay_candidates_remaining: {after['replay_candidates']}",
         f"chunk_refs_repointed: {repointed}",
+        f"summary_node_refs_repointed: {summary_refs_repointed}",
         f"orphan_chunk_refs: {orphans}",
         f"backup_path: {backup['backup_path']}",
         f"backup_size_bytes: {backup['backup_size']}",
         "note: the earliest row of each cluster was kept; content is identical across a cluster",
         "note: only rows proven to sit inside an ordered replay (>=5 consecutive) were removed",
     ])
+
+
+def _repoint_summary_node_source_ids(conn, node_cols: set) -> int:
+    """Move summary-node source_ids from a dedup victim to its keeper.
+
+    Rewrites only the ids present in ``temp.trove_dedup_map``; every other
+    source is left byte-identical.  Returns the number of individual refs
+    repointed.
+
+    Walks affected nodes in Python rather than in SQL because ``source_ids`` is
+    a JSON array of ints, and JSON1 cannot express "replace each element via a
+    join" — ``json_set`` needs a path per element, which is a per-row loop by
+    construction.  Bounded by the number of nodes that actually cite a victim
+    (measured: 2 of 20 on the live DB), so the loop is not the hot path.
+    """
+    key = "node_id" if "node_id" in node_cols else "rowid"
+    victims = {
+        int(r[0]): int(r[1])
+        for r in conn.execute("SELECT victim, keeper FROM temp.trove_dedup_map")
+    }
+    if not victims:
+        return 0
+    moved = 0
+    rows = conn.execute(
+        f"SELECT {key}, source_ids FROM summary_nodes "
+        "WHERE source_type = 'messages' AND source_ids IS NOT NULL"
+    ).fetchall()
+    for node_key, raw in rows:
+        try:
+            ids = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(ids, list):
+            continue
+        replaced, changed = [], 0
+        for i in ids:
+            try:
+                keeper = victims.get(int(i))
+            except (TypeError, ValueError):
+                keeper = None
+            if keeper is None:
+                replaced.append(i)
+                continue
+            replaced.append(keeper)
+            if keeper != i:
+                changed += 1
+        if not changed:
+            continue
+        moved += changed
+        conn.execute(
+            f"UPDATE summary_nodes SET source_ids = ? WHERE {key} = ?",
+            (json.dumps(replaced), node_key),
+        )
+    return moved
 
 
 def _dangling_non_repointable_refs(conn, victims: list[int]) -> int:
