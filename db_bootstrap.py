@@ -3801,6 +3801,12 @@ def run_message_identity_migration(conn: sqlite3.Connection) -> int:
     if "observed_at" not in _cols or "ingested_at" not in _cols:
         return 0
 
+    # v2 and v3 below are NOT nested inside the v1 gate.  They were, which made
+    # them unreachable on every store that had already completed v1 -- v2 got
+    # away with it only because an early open happened to record the marker
+    # before v1 landed, and v3 (the NULL-observed_at backstop) has never run on
+    # any live store.  Each step must be gated only on its own marker, or a
+    # step added after v1 ships is dead code for every existing install.
     if not _has_named_migration_step(conn, "messages_identity_index_v1"):
         try:
             ensure_message_identity_index(conn)
@@ -3820,58 +3826,50 @@ def run_message_identity_migration(conn: sqlite3.Connection) -> int:
             return 0
         mark_migration_step_complete(conn, "messages_identity_index_v1")
 
-        # v2: upgrade the identity index to include tool_calls. The v1 index
-        # (without tool_calls) exists at this point and pages beyond the
-        # existing callers of this function; CREATE IF NOT EXISTS skips it. We
-        # explicitly drop + recreate under a named marker so legacy installs get
-        # the column without manual SQL. Rolling back this marker is not
-        # supported: the v1 index definition has been removed from
-        # `_MESSAGES_IDENTITY_INDEX`, so recreating without the marker loses the
-        # previous column shape and a re-upgrade would still land v2.
-        if not _has_named_migration_step(conn, "messages_identity_index_v2"):
-            try:
-                conn.execute("DROP INDEX IF EXISTS idx_msg_identity")
-                ensure_message_identity_index(conn)
-                mark_migration_step_complete(conn, "messages_identity_index_v2")
-            except sqlite3.IntegrityError:
-                logger.warning(
-                    "TROVE identity index upgrade to v2 (tool_calls) failed: "
-                    "duplicate message-identity clusters exist. The v1 index was "
-                    "dropped; run_message_identity_dedup to remove duplicates and "
-                    "land the v2 index on next open."
-                )
-            except sqlite3.OperationalError as exc:
-                # Fresh DB: v1 was just created successfully but the v2 drop
-                # + recreate fails because the table exists — the existing index
-                # is on a clean DB so we just recreate it. Any other
-                # OperationalError is genuinely unexpected and should reach the
-                # caller so operators can see it.
-                logger.warning(
-                    "TROVE identity index v2 recreate failed after v1 landed: %s; continuing with v1 shape",
-                    exc,
-                )
+    if not _has_named_migration_step(conn, "messages_identity_index_v2"):
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_msg_identity")
+            ensure_message_identity_index(conn)
+            mark_migration_step_complete(conn, "messages_identity_index_v2")
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "TROVE identity index upgrade to v2 (tool_calls) failed: "
+                "duplicate message-identity clusters exist. The v1 index was "
+                "dropped; run_message_identity_dedup to remove duplicates and "
+                "land the v2 index on next open."
+            )
+        except sqlite3.OperationalError as exc:
+            # Fresh DB: v1 was just created successfully but the v2 drop
+            # + recreate fails because the table exists — the existing index
+            # is on a clean DB so we just recreate it. Any other
+            # OperationalError is genuinely unexpected and should reach the
+            # caller so operators can see it.
+            logger.warning(
+                "TROVE identity index v2 recreate failed after v1 landed: %s; continuing with v1 shape",
+                exc,
+            )
 
-        # v3: NULL-observed_at backstop.  Additive and independent of the v1/v2
-        # shape above -- it only covers rows the primary index structurally
-        # cannot protect, so it never needs the drop/recreate dance.  It CANNOT
-        # be built while duplicate timestamp-less rows exist; the passive pass
-        # must not delete data, so we log and retry on the next open (the
-        # operator collapses them with `/trove doctor duplicate apply`).
-        if not _has_named_migration_step(conn, "messages_identity_index_v3"):
-            try:
-                ensure_message_identity_ts_fallback_index(conn)
-                mark_migration_step_complete(conn, "messages_identity_index_v3")
-            except sqlite3.IntegrityError:
-                logger.warning(
-                    "TROVE identity timestamp-fallback index not created: duplicate "
-                    "rows without a host timestamp exist. Run `/trove doctor "
-                    "duplicate apply` to collapse them; the index lands on the "
-                    "next open."
-                )
-            except sqlite3.OperationalError as exc:
-                logger.warning(
-                    "TROVE identity timestamp-fallback index not created: %s", exc,
-                )
+    # v3: NULL-observed_at backstop.  Additive and independent of the v1/v2
+    # shape above -- it only covers rows the primary index structurally
+    # cannot protect, so it never needs the drop/recreate dance.  It CANNOT
+    # be built while duplicate timestamp-less rows exist; the passive pass
+    # must not delete data, so we log and retry on the next open (the
+    # operator collapses them with `/trove doctor duplicate apply`).
+    if not _has_named_migration_step(conn, "messages_identity_index_v3"):
+        try:
+            ensure_message_identity_ts_fallback_index(conn)
+            mark_migration_step_complete(conn, "messages_identity_index_v3")
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "TROVE identity timestamp-fallback index not created: duplicate "
+                "rows without a host timestamp exist. Run `/trove doctor "
+                "duplicate apply` to collapse them; the index lands on the "
+                "next open."
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "TROVE identity timestamp-fallback index not created: %s", exc,
+            )
 
     return 0
 
