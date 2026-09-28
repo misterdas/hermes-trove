@@ -44,6 +44,7 @@ keyword arm ran".
 | `vector_store.py` | Brute-force/two-stage KNN over `trove_embedding_profile` tables; int8 + sign-bit prescreen (SPEC C1) | Identity-hash isolation: vectors from different embedding models never mix. |
 | `embedding_provider.py` | `resolve_provider()` → voyage / ollama / fastembed; spend guard + circuit breaker | Backfill and query paths have **different** budgets — keep them different. |
 | `store.py`, `db_bootstrap.py`, `schemas.py` | Raw message store, WAL/JournalMode, FTS5 index, schema migration steps | Schema changes MUST go through a migration step (`mark_migration_step_complete`); never ALTER live DB. |
+| `reconcile.py` | Ingest cursor: decides which incoming messages are genuinely new vs. a host replay (~86k) | Two cursors — front-anchored ordered, and order-blind multiset membership. See §4; getting this wrong duplicates or drops history silently. |
 | `trajectory_store.py`, `compaction.py`, `rollup_*.py` | History trajectories, compaction math, rollup builders/stores | |
 | `retention.py` | Session retention (v1.2.0): delete stale raw messages, keep summary nodes; `TROVE_RETENTION_DAYS=0` = keep forever | Single-gate model; pin guard is transactional. |
 | `embed_worker.py` | Background embedding backfill worker (F1) + `embed status` command (F2) | |
@@ -126,6 +127,35 @@ keyword arm ran".
 - **`plugin.yaml` declares `python_runtime: external`** — the Hermes package manager
   must NOT uv-lock this repo's dependencies. The plugin's `__init__.py` re-exports the
   `hermes-trove` PyPI package.
+- **SQLite treats NULLs as distinct in a UNIQUE index.** `idx_msg_identity` keys on
+  `observed_at` raw, so a row with `observed_at IS NULL` opted out of uniqueness
+  *entirely* and the conflict-safe insert could never catch it. A host that replays
+  without per-message timestamps wrote unbounded duplicate rows that no application
+  guard could see. When adding a UNIQUE index over a nullable column, decide explicitly
+  whether NULLs should collide — coalesce to a sentinel, or add the companion partial
+  index (`idx_msg_identity_ts_fallback`, `WHERE observed_at IS NULL`) — and write the
+  test that proves the NULL row is rejected.
+- **A restart makes the host replay its entire history.** Never assume the incoming
+  message window is "new since last turn" — after a gateway restart the host re-sends
+  every stored row, interleaved. A cursor that only advances on a *front-anchored
+  ordered* match never advances at all, so each turn re-appends the whole session (seen:
+  23,436 rows, ~+1,000/turn). `reconcile.py` therefore reconciles against durable stored
+  history as an **order-blind multiset**, and requires a surplus-repeat proof before
+  skipping: a front match *alone* is not evidence of a replay, because stored history can
+  legitimately open with what the host just sent, and skipping there silently drops the
+  new rows behind it. When ingest volume looks wrong, read
+  `engine._last_ingest_reconciliation['reason']` — `replayed durable stored membership`
+  is the healthy value.
+- **Deleting a row is not the whole job.** Any operator cleanup that removes
+  `messages.store_id` must re-point `summary_nodes.source_ids` and chunk references at
+  the surviving row in the same transaction, or rollup nodes end up referencing deleted
+  ids.
+- **`TROVE_DOCTOR_CLEAN_APPLY_ENABLED` defaults to `false`** (`config.py`).
+  `/trove doctor duplicate` is read-only and always safe to run; `apply` is the
+  destructive half and is denied without the env flag. The collapse is deliberately
+  conservative — a repeat shorter than 5 consecutive rows is treated as legitimate — so a
+  healthy store can still report a few duplicate clusters after an apply. That is the
+  guard working, not a partial delete.
 
 ## 5. Working style in this repo
 
