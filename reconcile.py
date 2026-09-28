@@ -1271,17 +1271,22 @@ class ReconcileMixin:
         available: Counter = Counter(stored_visible)
         cursor = 0
         matched: List[tuple[str, str, str, str]] = []
-        for msg in messages:
+        for position, msg in enumerate(messages):
             identity = _incoming_identity(msg)
             if identity is None:
                 # Synthetic/filtered message: carries no durable row, so it
-                # must not consume a stored slot.
+                # must not consume a stored slot.  It DOES still occupy a
+                # position in the window, and the engine slices the window
+                # with this value (engine.py: ``replay_messages[cursor:]``),
+                # so the cursor must be advanced past it or every message
+                # after the first filtered one is re-appended on replay.
+                cursor = position + 1
                 continue
             if available[identity] <= 0:
                 break
             available[identity] -= 1
             matched.append(identity)
-            cursor += 1
+            cursor = position + 1
         if not cursor:
             return None
 

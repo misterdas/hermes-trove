@@ -231,6 +231,48 @@ def test_membership_cursor_never_exceeds_verified_membership(tmp_path):
         assert cursor is None or cursor <= safe
 
 
+def test_membership_cursor_is_a_position_not_a_match_count(tmp_path):
+    """The engine slices with this value, so it must be a position.
+
+    ``engine.py`` ingests ``replay_messages[cursor:]``.  A filtered message
+    (one that carries no durable row) consumes no stored slot, so counting
+    matches instead of positions left the cursor short by one and re-appended
+    the entire filtered prefix on every replay.  The live store hit exactly
+    this: a scaffold placeholder the matcher drops, sitting in front of a
+    stored conversation.
+    """
+    engine = _engine(tmp_path)
+    conversation = [_identity("user", f"m{i}") for i in range(6)]
+    stored = _interleaved(conversation)
+
+    # A scaffold placeholder the matcher filters, then the stored conversation.
+    incoming = [{"role": "user",
+                 "content": "[Current user objective preserved from compacted history]\nkeep going"}]
+    incoming += conversation
+
+    cursor = engine._membership_cursor_for_store_head(incoming, stored)
+    assert cursor == len(incoming), (
+        "cursor must be the index past the last accounted-for message, not a "
+        f"count of matched rows (got {cursor}, want {len(incoming)})"
+    )
+    assert incoming[cursor:] == []
+
+
+def test_membership_cursor_advances_past_interior_filtered_messages(tmp_path):
+    """A filtered message in the middle must not shift the slice either."""
+    engine = _engine(tmp_path)
+    conversation = [_identity("user", f"m{i}") for i in range(6)]
+    stored = _interleaved(conversation)
+
+    incoming = list(conversation)
+    incoming.insert(3, {"role": "user",
+                        "content": "[Current user objective preserved from compacted history]\nmid"})
+
+    cursor = engine._membership_cursor_for_store_head(incoming, stored)
+    assert cursor == len(incoming)
+    assert incoming[cursor:] == []
+
+
 # --- 2. NULL observed_at identity index --------------------------------------
 
 
