@@ -2654,6 +2654,29 @@ _MESSAGES_IDENTITY_INDEX = (
     "COALESCE(tool_calls, ''))"
 )
 
+# Second, ADDITIVE identity backstop for rows that carry no host timestamp.
+# ``idx_msg_identity`` keys on ``observed_at`` raw, so a NULL ``observed_at``
+# is distinct from every other NULL and the row opts out of uniqueness
+# entirely (SQLite treats NULLs as distinct in a UNIQUE index).  Hosts that
+# replay without per-message timestamps -- the gateway restart path is the
+# common case -- therefore wrote unbounded duplicate rows that the primary
+# index could never catch.
+#
+# This index keeps NULLs participating by folding them onto ``ingested_at``,
+# which is always populated.  It is a *separate* index rather than a change
+# to ``idx_msg_identity``: the primary index is load-bearing for the
+# conflict-safe insert and its recreate path, and its operator-facing
+# semantics ("only rows with a trusted observation time are protected")
+# must not change underneath them.  Additive + idempotent, so it can land
+# before the existing duplicates are cleaned.
+_MESSAGES_IDENTITY_TS_FALLBACK_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_identity_ts_fallback "
+    "ON messages(session_id, role, COALESCE(observed_at, ingested_at), "
+    "COALESCE(tool_call_id, ''), COALESCE(content, ''), "
+    "COALESCE(tool_calls, '')) "
+    "WHERE observed_at IS NULL"
+)
+
 
 def ensure_message_identity_index(conn: sqlite3.Connection) -> None:
     """Create the per-message identity unique index (additive, idempotent).
@@ -2664,10 +2687,25 @@ def ensure_message_identity_index(conn: sqlite3.Connection) -> None:
     lookup do (a plain column list would let two NULLs through, and
     ``ON CONFLICT`` on a column list cannot see expression indexes).
     ``observed_at`` stays raw on purpose: rows without a trusted
-    observation time are never collapsed (documented limitation, matching
-    the storage-level guard).
+    observation time are never collapsed by THIS index.  The companion
+    ``idx_msg_identity_ts_fallback`` covers exactly that gap.
     """
     conn.execute(_MESSAGES_IDENTITY_INDEX)
+
+
+def ensure_message_identity_ts_fallback_index(conn: sqlite3.Connection) -> None:
+    """Create the NULL-``observed_at`` identity backstop (additive).
+
+    Folds a missing ``observed_at`` onto ``ingested_at`` so timestamp-less
+    rows still participate in uniqueness.  Partial (``WHERE observed_at IS
+    NULL``) so it never competes with ``idx_msg_identity`` over rows that
+    already have a trusted observation time.
+
+    Cannot be built while duplicate timestamp-less rows exist; the caller
+    logs and retries on the next open rather than deleting data from a
+    passive schema-ensure pass.
+    """
+    conn.execute(_MESSAGES_IDENTITY_TS_FALLBACK_INDEX)
 
 
 def _has_named_migration_step(conn: sqlite3.Connection, step_name: str) -> bool:
@@ -3811,6 +3849,28 @@ def run_message_identity_migration(conn: sqlite3.Connection) -> int:
                 logger.warning(
                     "TROVE identity index v2 recreate failed after v1 landed: %s; continuing with v1 shape",
                     exc,
+                )
+
+        # v3: NULL-observed_at backstop.  Additive and independent of the v1/v2
+        # shape above -- it only covers rows the primary index structurally
+        # cannot protect, so it never needs the drop/recreate dance.  It CANNOT
+        # be built while duplicate timestamp-less rows exist; the passive pass
+        # must not delete data, so we log and retry on the next open (the
+        # operator collapses them with `/trove doctor duplicate apply`).
+        if not _has_named_migration_step(conn, "messages_identity_index_v3"):
+            try:
+                ensure_message_identity_ts_fallback_index(conn)
+                mark_migration_step_complete(conn, "messages_identity_index_v3")
+            except sqlite3.IntegrityError:
+                logger.warning(
+                    "TROVE identity timestamp-fallback index not created: duplicate "
+                    "rows without a host timestamp exist. Run `/trove doctor "
+                    "duplicate apply` to collapse them; the index lands on the "
+                    "next open."
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "TROVE identity timestamp-fallback index not created: %s", exc,
                 )
 
     return 0

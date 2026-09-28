@@ -1067,6 +1067,116 @@ class ReconcileMixin:
             return False
         return _tagless_identities(stored_head)[: len(tagless_incoming)] == tagless_incoming
 
+
+    def _front_anchored_cursor_for_store_head(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_head_rows: List[Dict[str, Any]],
+    ) -> int | None:
+        """Cursor from an ordered FRONT match against stored history.
+
+        Returns the number of leading ``messages`` that are already stored,
+        or ``None`` when no ordered overlap can be trusted.  Mirrors the
+        tail-path filters (scaffold / ignore-pattern / placeholder) so a
+        synthetic prefix cannot manufacture skip evidence.
+
+        Deliberately *not* a set-membership match: two genuinely repeated
+        messages ("ok" twice) must stay two rows.  Order is what makes the
+        Nth incoming message bind to the Nth stored one, so the only
+        reachable error is a boundary that is a little too early -- which
+        re-ingests a few already-stored rows rather than dropping new ones.
+        """
+        if not messages or not stored_head_rows:
+            return None
+
+        # Externalized tool output is resolved by dedicated machinery upstream
+        # (durable payload lookup, live-file freshness, forged-marker rejection).
+        # This ordered front match compares raw replay identity and cannot see
+        # any of that, so it must not claim a prefix containing a persisted-output
+        # marker -- the tail path already handles those with full proofs, and it
+        # runs first.  Bailing here keeps that behavior intact.
+        for msg in messages:
+            if str(msg.get("role") or "") == "tool" and _is_hermes_persisted_output_marker(
+                normalize_content_value(msg.get("content")) or ""
+            ):
+                return None
+
+        def _tagless(msg: Dict[str, Any], stored_row: bool) -> tuple[str, str, str, str]:
+            role, content, tool_calls, tool_call_id = self._message_replay_identity(
+                msg, stored_row=stored_row,
+            )
+            return (role, _strip_replay_identity_shape_tag(content), tool_calls, tool_call_id)
+
+        def _incoming_identity(msg: Dict[str, Any]) -> tuple[str, str, str, str] | None:
+            if self._is_replayed_context_scaffold_message(msg):
+                return None
+            if self._matches_ignore_message_patterns(msg):
+                return None
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            if self._is_volatile_ignored_quarantine_placeholder(msg, text):
+                return None
+            if self._is_ignored_active_replay_placeholder(msg, text):
+                return None
+            return _tagless(msg, stored_row=False)
+
+        # Skip stored rows the incoming list would never carry (filtered
+        # history), so alignment compares like with like.
+        stored_visible = [
+            _tagless(row, stored_row=True)
+            for row in stored_head_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        if not stored_visible:
+            return None
+
+        cursor = 0
+        for msg in messages:
+            identity = _incoming_identity(msg)
+            if identity is None:
+                # Synthetic/filtered message: it carries no durable row, so
+                # it must not consume a stored slot.
+                continue
+            if cursor >= len(stored_visible) or identity != stored_visible[cursor]:
+                break
+            cursor += 1
+        if not cursor:
+            return None
+
+        # A front match ALONE is not proof of a replay.  Stored history can
+        # legitimately begin with the same messages the host just sent -- a
+        # compaction that re-emits its opening, or a session rebound replaying
+        # a prefix that is about to be extended.  Skipping there would drop the
+        # genuinely new rows that follow, so require independent evidence that
+        # the matched prefix is ALREADY duplicated later in stored history: a
+        # replay signature the host cannot have produced on this turn.  The
+        # ordered check (>=5 consecutive) matches the operator cleanup proof.
+        if not self._stored_head_contains_ordered_repeat(stored_visible, cursor):
+            return None
+        return cursor
+
+    @staticmethod
+    def _stored_head_contains_ordered_repeat(
+        stored_visible: List[tuple[str, str, str, str]],
+        prefix_len: int,
+        window: int = 5,
+    ) -> bool:
+        """True when ``stored_visible[prefix_len:]`` replays an earlier run.
+
+        Scans for any run of ``window`` consecutive identities that appears
+        twice in the stored prefix.  Two occurrences of the same ordered run
+        is re-ingest evidence; a single occurrence is just a conversation.
+        """
+        if prefix_len < 1 or len(stored_visible) < prefix_len + window:
+            return False
+        seen: set[tuple] = set()
+        for i in range(len(stored_visible) - window + 1):
+            chunk = tuple(stored_visible[i:i + window])
+            if chunk in seen:
+                return True
+            seen.add(chunk)
+        return False
+
+
     @staticmethod
     def _stored_head_contains_surplus_repeat(
         stored_visible: List[tuple[str, str, str, str]],
@@ -1353,6 +1463,43 @@ class ReconcileMixin:
                 session_count,
             )
             return len(messages)
+
+        # Last resort before re-sending everything: an ordered FRONT match
+        # against stored history.  The tail-suffix check above only recognizes
+        # a replay that ends where stored history ends.  Re-ingest is normally
+        # observed MID-conversation -- the host re-sends the conversation that
+        # is live *right now*, so the copies land while the stored tail is
+        # itself part of the copy -- and the suffix check then matches nothing,
+        # falling through to cursor=0 and re-sending the whole conversation
+        # again.  The rows that write makes the NEXT reconciliation match
+        # worse, so each restart multiplied the stored rows instead of
+        # converging.
+        #
+        # Ordered matching from the front is order-sensitive while identity
+        # membership is not: the Nth incoming message can only bind to the Nth
+        # stored message, so a genuinely new message that merely echoes old
+        # content sits at a LATER position and simply fails to match.  The only
+        # reachable error is a boundary that is a little too early -- which
+        # re-ingests a few already-stored rows, never drops a new one.  It runs
+        # LAST because every check above is more specific (persisted-output
+        # recovery, scaffold prefixes, stale snapshots) and must keep priority.
+        front_cursor = self._front_anchored_cursor_for_store_head(messages, stored_head_rows)
+        if front_cursor is not None and front_cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed durable front prefix",
+                cursor=front_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.debug(
+                "TROVE reconciled ingest cursor from stored front: session=%s cursor=%d incoming=%d stored_head=%d",
+                self._session_id, front_cursor, len(messages), len(stored_head),
+            )
+            return front_cursor
+
 
         self._record_ingest_reconciliation(
             action="persisted batch",

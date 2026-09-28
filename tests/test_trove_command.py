@@ -1868,21 +1868,47 @@ def _reingest(engine, session_id: str, role: str, content: str, times: int) -> N
 
 
 def test_trove_doctor_duplicate_reports_reingested_rows(tmp_path):
+    """A replayed WINDOW is reported as candidates.
+
+    A single message repeated 4x is NOT replay-proven: content identity
+    alone cannot tell it from the user genuinely repeating themselves, so it
+    is reported as a redundant repeat but never proposed for deletion.
+    """
     config = TROVEConfig(database_path=str(tmp_path / "trove_dup_check.db"))
     engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
     engine.on_session_start("dup-session", platform="cli", context_length=200000)
-    _reingest(engine, "dup-session", "user", "same message", 4)
+    conversation = [{"role": "user", "content": f"message {i}"} for i in range(10)]
+    for _ in range(2):
+        for msg in conversation:
+            engine._store.append("dup-session", dict(msg))
 
     result = handle_trove_command("doctor duplicate", engine)
 
     assert "TROVE doctor duplicate" in result
     assert "status: candidates-found" in result
-    assert "duplicate_clusters: 1" in result
-    assert "redundant_rows: 3" in result
-    assert "largest_cluster_extra: 3" in result
+    assert "redundant_rows: 10" in result
+    assert "replay_candidates: 10" in result
+    assert "largest_cluster_extra: 1" in result
     assert "no rows were deleted" in result
     # read-only: re-running still sees the same count
-    assert "redundant_rows: 3" in handle_trove_command("doctor duplicate", engine)
+    assert "replay_candidates: 10" in handle_trove_command("doctor duplicate", engine)
+
+
+def test_trove_doctor_duplicate_short_repeat_is_not_a_candidate(tmp_path):
+    """A sub-window repeat is a legitimate conversation repeat, never a delete."""
+    config = TROVEConfig(database_path=str(tmp_path / "trove_dup_short.db"))
+    engine = TROVEEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine.on_session_start("short-dup-session", platform="cli", context_length=200000)
+    _reingest(engine, "short-dup-session", "user", "same message", 4)
+
+    result = handle_trove_command("doctor duplicate", engine)
+
+    assert "status: ok" in result
+    assert "duplicate_clusters: 1" in result
+    assert "redundant_rows: 3" in result
+    assert "replay_candidates: 0" in result
+    assert "none sit inside an ordered replay" in result
+    assert "no rows were deleted" in result
 
 
 def test_trove_doctor_duplicate_clean_db_reports_ok(tmp_path):

@@ -91,6 +91,10 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages
 # ``UNIQUE constraint failed: index 'idx_msg_identity'`` error, re-selects the
 # canonical row. See ``_insert_message_conflict_safe``.
 _MSG_IDENTITY_INDEX = "idx_msg_identity"
+# The primary index plus the NULL-observed_at companion.  A conflict raised by
+# ANY of these means the host re-sent an already-persisted message, so the
+# insert path treats them alike.  See ``_insert_message_conflict_safe``.
+_MSG_IDENTITY_INDEXES = (_MSG_IDENTITY_INDEX, "idx_msg_identity_ts_fallback")
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -626,10 +630,16 @@ class MessageStore:
         3. any *other* ``IntegrityError`` (e.g. a NOT NULL violation) is
            re-raised, never swallowed.
 
-        A row with ``observed_at IS NULL`` can never collide (NULL is distinct
-        in the index), so the exception path is unreachable for it and it
-        inserts exactly as before. A failed INSERT is statement-level in
-        SQLite (it does not abort the surrounding transaction and consumes no
+        A row with ``observed_at IS NULL`` can never collide through
+        ``idx_msg_identity`` (NULL is distinct in the index), so that branch
+        stays unreachable for it.  It can still collide through the
+        companion ``idx_msg_identity_ts_fallback`` when the host re-sends
+        the same timestamp-less message *within the same second* -- the
+        fallback keys on ``ingested_at`` in that case -- so both index
+        names are recognized here and the re-SELECT uses the same value the
+        violated index compared (``observed_at`` when present, otherwise
+        ``ingested_at``).  A failed INSERT is statement-level in SQLite
+        (it does not abort the surrounding transaction and consumes no
         AUTOINCREMENT id), so the re-SELECT is safe mid-transaction and the
         batch's id list stays aligned with its input messages.
         """
@@ -637,17 +647,26 @@ class MessageStore:
             cur = self._conn.execute(_INSERT_MESSAGE_SQL, row_params)
             return cur.lastrowid
         except sqlite3.IntegrityError as err:
-            if f"index '{_MSG_IDENTITY_INDEX}'" not in str(err):
+            message = str(err)
+            violated = next(
+                (name for name in _MSG_IDENTITY_INDEXES if f"index '{name}'" in message),
+                None,
+            )
+            if violated is None:
                 # Not an identity conflict (e.g. a NOT NULL violation):
                 # preserve the real error — never mask it.
                 raise
-            if row_params[12] is None:
-                # Unreachable in practice (a NULL observed_at cannot collide)
-                # but fail loudly rather than invent a row if we ever get here.
+            if row_params[12] is None and row_params[11] is None:
+                # Unreachable in practice (both time columns are always
+                # populated on insert) but fail loudly rather than invent a
+                # row if we ever get here.
                 raise RuntimeError(
-                    "message identity conflict without an observed_at "
+                    "message identity conflict without a timestamp "
                     "(session_id, role, tool_call_id, content, tool_calls)"
                 ) from err
+            # observed_at when the host supplied one, else ingested_at -- the
+            # value the violated index actually compared.
+            identity_time = row_params[12] if row_params[12] is not None else row_params[11]
             existing = self._conn.execute(
                 "SELECT store_id FROM messages WHERE session_id = ? AND role = ? "
                 "AND observed_at IS ? "
@@ -658,7 +677,7 @@ class MessageStore:
                 (
                     row_params[0],
                     row_params[3],
-                    row_params[12],
+                    identity_time,
                     (row_params[5] if row_params[5] is not None else ""),
                     (row_params[4] if row_params[4] is not None else ""),
                     (row_params[6] if row_params[6] is not None else ""),

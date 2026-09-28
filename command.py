@@ -2495,6 +2495,10 @@ def _message_duplicate_stats(engine) -> dict:
     cluster, because SQLite treats NULLs as distinct. That folding is
     what makes this check see the bulk of them — ``observed_at`` is NULL
     for ~75% of rows, since the host supplies no message timestamp.
+
+    ``replay_candidates`` counts only the rows an apply would actually
+    remove (see ``_message_duplicate_cleanup_rows``): a session may hold
+    genuine repeats of the same content, and those must survive.
     """
     conn = engine._lifecycle.connection
     rows = conn.execute(
@@ -2511,30 +2515,126 @@ def _message_duplicate_stats(engine) -> dict:
         """
     ).fetchone()
     clusters, redundant, largest = int(rows[0]), int(rows[1]), int(rows[2])
-    return {
+    stats = {
         "clusters": clusters,
         "redundant": redundant,
         "largest": largest,
         "total": int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]),
     }
+    stats["replay_candidates"] = len(_message_duplicate_cleanup_rows(conn))
+    return stats
+
+
+# The identity used for replay-cluster cleanup.  Deliberately EXCLUDES
+# ``observed_at``: the gateway-restart re-ingest writes timestamp-less rows
+# (observed_at IS NULL for ~73% of Telegram traffic), so keying on the
+# timestamp — as the storage-level dedup does — cannot see the bulk of the
+# damage.  Ordering by store_id and keeping the earliest row makes the
+# deletion lossless for a genuine replay: the surviving copy is byte-identical.
+_MESSAGE_DUP_IDENTITY = (
+    "session_id, role, COALESCE(tool_call_id, ''), "
+    "COALESCE(content, ''), COALESCE(tool_calls, '')"
+)
+
+# A row is only removed when it sits inside an ordered repeat of at least
+# this many consecutive already-stored rows.  Content identity ALONE cannot
+# tell a replay copy from a legitimate repeat (the user genuinely sending
+# "ok" twice must stay two rows), but a long ordered run of identical rows
+# is replay evidence no legitimate conversation produces.  Short clusters
+# are left alone: a missed duplicate is recoverable, a dropped message is not.
+_DUP_REPLAY_WINDOW = 5
+
+
+def _message_duplicate_cleanup_rows(conn) -> list[tuple[int, int]]:
+    """Return ``(victim_store_id, keeper_store_id)`` pairs, replay-proven only.
+
+    Mirrors ``db_bootstrap._earlier_cluster_member_expr`` (keep the
+    earliest ``store_id`` per identity) but drops the NULL-``observed_at``
+    exclusion, then intersects with the ordered-replay proof.  Returns an
+    empty list when the database is clean.
+    """
+    clusters = conn.execute(
+        f"""
+        SELECT store_id, MIN(store_id) OVER (PARTITION BY {_MESSAGE_DUP_IDENTITY}) AS keeper,
+               ROW_NUMBER() OVER (PARTITION BY {_MESSAGE_DUP_IDENTITY} ORDER BY store_id) AS rn
+        FROM messages
+        """
+    ).fetchall()
+    victims = {int(sid): int(keeper) for sid, keeper, rn in clusters if rn > 1}
+    if not victims:
+        return []
+
+    # Ordered-replay proof: within each session (store_id order), a run of
+    # >=_DUP_REPLAY_WINDOW consecutive rows whose identity sequence already
+    # appeared earlier in THAT session is replay evidence.  Tracked
+    # incrementally over a rolling window; a genuine conversation never
+    # repeats five consecutive rows in order.
+    ordered = conn.execute(
+        f"""
+        SELECT session_id, store_id, {_MESSAGE_DUP_IDENTITY} FROM messages
+        ORDER BY session_id, store_id
+        """
+    ).fetchall()
+    proven: set[int] = set()
+    seen_windows: set[tuple] = set()
+    window: list[tuple[int, tuple]] = []
+    window_session: str | None = None
+
+    def _flush(seen: set[int], seen_chunks: set[tuple]) -> None:
+        chunk = tuple(x[1] for x in window)
+        if chunk in seen_chunks:
+            seen.update(x[0] for x in window)
+        else:
+            seen_chunks.add(chunk)
+
+    for row in ordered:
+        session_id, store_id = row[0], int(row[1])
+        ident = tuple(row[2:])
+        if session_id != window_session and len(window) == _DUP_REPLAY_WINDOW:
+            # A session boundary: the rolling window must never straddle two
+            # conversations, so close the old one first.
+            _flush(proven, seen_windows)
+            window = []
+        window_session = session_id
+        window.append((int(store_id), tuple(ident)))
+        if len(window) > _DUP_REPLAY_WINDOW:
+            chunk = tuple(x[1] for x in window[:-1])
+            if chunk in seen_windows:
+                proven.update(x[0] for x in window[:-1])
+            else:
+                seen_windows.add(chunk)
+            window.pop(0)
+    if len(window) == _DUP_REPLAY_WINDOW:
+        _flush(proven, seen_windows)
+
+    return [(v, victims[v]) for v in sorted(proven) if v in victims]
 
 
 def _doctor_duplicate_text(engine) -> str:
     stats = _message_duplicate_stats(engine)
     lines = [
         "TROVE doctor duplicate",
-        f"status: {'candidates-found' if stats['redundant'] else 'ok'}",
+        f"status: {'candidates-found' if stats['replay_candidates'] else 'ok'}",
         f"messages_total: {stats['total']}",
         f"duplicate_clusters: {stats['clusters']}",
         f"redundant_rows: {stats['redundant']}",
+        f"replay_candidates: {stats['replay_candidates']}",
         f"largest_cluster_extra: {stats['largest']}",
     ]
-    if not stats["redundant"]:
-        lines.append("note: no duplicate message rows — nothing to clean")
+    if not stats["replay_candidates"]:
+        lines.append("note: read-only scan — no rows were deleted")
+        if stats["redundant"]:
+            lines.extend([
+                "note: identical content repeats exist, but none sit inside an ordered replay",
+                "note: a repeat shorter than 5 consecutive rows is treated as legitimate and kept",
+            ])
+        else:
+            lines.append("note: no duplicate message rows — nothing to clean")
         return "\n".join(lines)
     lines.extend([
         "note: read-only scan — no rows were deleted",
-        "note: identical content re-ingested under a new store_id; the earliest row of each cluster is kept",
+        "note: replay rows are byte-identical to the row they duplicate; the earliest of each cluster is kept",
+        "note: only rows proven to sit inside an ordered replay (>=5 consecutive) are eligible",
         "note: use `/trove doctor duplicate apply` to collapse them",
     ])
     return "\n".join(lines)
@@ -2551,11 +2651,20 @@ def _doctor_duplicate_apply_text(engine) -> str:
         ])
 
     before = _message_duplicate_stats(engine)
-    if not before["redundant"]:
+    if not before["replay_candidates"]:
         return "\n".join([
             "TROVE doctor duplicate apply",
             "status: ok",
-            "note: no duplicate message rows — nothing to do",
+            f"messages_total: {before['total']}",
+            f"redundant_rows: {before['redundant']}",
+            "note: no replay-proven duplicate rows — nothing to do",
+            *(
+                [
+                    "note: identical content repeats exist but sit outside an ordered replay; kept as legitimate",
+                ]
+                if before["redundant"]
+                else ["note: no duplicate message rows — nothing to clean"]
+            ),
         ])
 
     backup = backup_database(engine)
@@ -2570,53 +2679,66 @@ def _doctor_duplicate_apply_text(engine) -> str:
         ])
 
     conn = engine._lifecycle.connection
-    # Chunk references must follow their row to the surviving earliest copy
-    # BEFORE the delete, or recall loses them. chunk_id derives from
-    # identity_hash (not store_id), so only store_id moves.
+    pairs = _message_duplicate_cleanup_rows(conn)
+    if not pairs:
+        return "\n".join([
+            "TROVE doctor duplicate apply",
+            "status: ok",
+            f"messages_total: {before['total']}",
+            "note: duplicate set changed between scan and apply — nothing removed",
+        ])
+
+    victims = [v for v, _ in pairs]
+    placeholders = ",".join("?" for _ in victims)
+
+    # Reference guards: a victim row that something still points at must not be
+    # deleted.  ``dedup_message_identity_clusters`` refuses outright in that
+    # case; here we instead REPOINT the chunk reference to the surviving
+    # earliest copy (chunk_id derives from identity_hash, not store_id, so
+    # only store_id moves) and refuse for the two references we cannot
+    # repoint -- summary-node source_ids and the lifecycle frontier, both of
+    # which are JSON/int leaves that would silently lose their target.
+    repointed = 0
     has_chunks = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trove_chunk_meta'"
     ).fetchone() is not None
+    conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
+    conn.execute(
+        "CREATE TEMP TABLE trove_dedup_map (victim INTEGER PRIMARY KEY, keeper INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO temp.trove_dedup_map (victim, keeper) VALUES (?, ?)", pairs
+    )
     if has_chunks:
-        conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
-        conn.execute(
-            """
-            CREATE TEMP TABLE trove_dedup_map AS
-            SELECT store_id AS victim, keep AS keeper FROM (
-                SELECT store_id,
-                       MIN(store_id) OVER (PARTITION BY session_id, role,
-                           COALESCE(observed_at, -1), COALESCE(tool_call_id, ''),
-                           COALESCE(content, ''), COALESCE(tool_calls, '')) AS keep,
-                       ROW_NUMBER() OVER (PARTITION BY session_id, role,
-                           COALESCE(observed_at, -1), COALESCE(tool_call_id, ''),
-                           COALESCE(content, ''), COALESCE(tool_calls, '')
-                           ORDER BY store_id) AS rn
-                FROM messages
-            ) WHERE rn > 1
-            """
-        )
         repointed = conn.execute(
             """
             UPDATE trove_chunk_meta
-            SET store_id = (SELECT d.keeper FROM trove_dedup_map d
+            SET store_id = (SELECT d.keeper FROM temp.trove_dedup_map d
                             WHERE d.victim = trove_chunk_meta.store_id)
-            WHERE store_id IN (SELECT victim FROM trove_dedup_map)
+            WHERE store_id IN (SELECT victim FROM temp.trove_dedup_map)
             """
         ).rowcount
-        conn.execute(
-            "DELETE FROM messages WHERE store_id IN (SELECT victim FROM trove_dedup_map)"
-        )
-    else:
-        repointed = 0
-        conn.execute(
-            """
-            DELETE FROM messages WHERE store_id NOT IN (
-                SELECT MIN(store_id) FROM messages
-                GROUP BY session_id, role, COALESCE(observed_at, -1),
-                         COALESCE(tool_call_id, ''), COALESCE(content, ''),
-                         COALESCE(tool_calls, '')
-            )
-            """
-        )
+
+    # Refuse (before deleting anything) if an unrepointable reference targets a
+    # victim.  Raising leaves the transaction to the caller's rollback, so the
+    # operator keeps every row and can inspect, exactly like the storage-level
+    # dedup precondition.
+    if _dangling_non_repointable_refs(conn, victims) > 0:
+        conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
+        return "\n".join([
+            "TROVE doctor duplicate apply",
+            "status: refused",
+            f"redundant_rows: {before['redundant']}",
+            f"replay_candidates: {before['replay_candidates']}",
+            "error: duplicate rows are referenced by summary nodes or a lifecycle frontier",
+            f"backup_path: {backup['backup_path']}",
+            "note: no rows were deleted — reconcile the references and re-run",
+        ])
+
+    removed = conn.execute(
+        f"DELETE FROM messages WHERE store_id IN ({placeholders})", victims
+    ).rowcount
+    conn.execute("DROP TABLE IF EXISTS temp.trove_dedup_map")
     conn.commit()
 
     after = _message_duplicate_stats(engine)
@@ -2630,15 +2752,56 @@ def _doctor_duplicate_apply_text(engine) -> str:
         "TROVE doctor duplicate apply",
         "status: ok",
         f"messages_before: {before['total']}",
-        f"redundant_rows_removed: {before['redundant'] - after['redundant']}",
+        f"redundant_rows_removed: {removed}",
         f"messages_after: {after['total']}",
         f"duplicate_clusters_remaining: {after['clusters']}",
+        f"replay_candidates_remaining: {after['replay_candidates']}",
         f"chunk_refs_repointed: {repointed}",
         f"orphan_chunk_refs: {orphans}",
         f"backup_path: {backup['backup_path']}",
         f"backup_size_bytes: {backup['backup_size']}",
         "note: the earliest row of each cluster was kept; content is identical across a cluster",
+        "note: only rows proven to sit inside an ordered replay (>=5 consecutive) were removed",
     ])
+
+
+def _dangling_non_repointable_refs(conn, victims: list[int]) -> int:
+    """Count victim rows referenced by something the apply cannot repoint.
+
+    Chunk references are repointed before the delete; summary-node
+    ``source_ids`` and the lifecycle frontier are not, so a victim they point
+    at is a hard stop.  Mirrors the preconditions in
+    ``db_bootstrap.dedup_message_identity_clusters``.
+    """
+    if not victims:
+        return 0
+    placeholders = ",".join("?" for _ in victims)
+    dangling = 0
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone():
+        dangling += conn.execute(
+            f"""
+            SELECT COUNT(*) FROM summary_nodes n, json_each(n.source_ids) j
+            WHERE n.source_type = 'messages'
+              AND CAST(j.value AS INTEGER) IN ({placeholders})
+            """,
+            victims,
+        ).fetchone()[0]
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trove_lifecycle_state'"
+    ).fetchone():
+        cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(trove_lifecycle_state)")
+        }
+        for col in ("frontier_store_id", "current_frontier_store_id",
+                    "last_finalized_frontier_store_id"):
+            if col in cols:
+                dangling += conn.execute(
+                    f"SELECT COUNT(*) FROM trove_lifecycle_state WHERE {col} IN ({placeholders})",
+                    victims,
+                ).fetchone()[0]
+    return int(dangling)
 
 
 def _backup_text(engine) -> str:
