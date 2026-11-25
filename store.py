@@ -144,6 +144,44 @@ def _restrict_created_sqlite_directory(path: Path) -> None:
         os.close(parent_fd)
 
 
+# Results of the full ``PRAGMA integrity_check`` issued by
+# ``startup_index_self_heal``, memoised per database path so one process does not
+# re-run an O(database size) scan for every agent clone it builds. The value is
+# ``(monotonic timestamp, last result)``.
+_STARTUP_SELF_HEAL_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+_STARTUP_SELF_HEAL_CACHE_LOCK = threading.Lock()
+
+
+def _cached_startup_index_self_heal(
+    db_path: Path, conn: sqlite3.Connection, interval_seconds: float
+) -> dict[str, object]:
+    """Run ``startup_index_self_heal`` at most once per interval per db path.
+
+    Every agent clone constructs its own ``MessageStore`` (see
+    ``TROVEEngine.clone_for_agent``), so a conversation-style workload paid the
+    full ``PRAGMA integrity_check`` cost on each rebuild even when nothing had
+    changed on disk. Results are memoised per process for ``interval_seconds``.
+
+    ``interval_seconds == 0`` reproduces the historical behaviour (check on
+    every open); a negative value checks once per process per path. A result that
+    could not be verified is NOT memoised — the next open retries rather than
+    inheriting "could not run" for the whole window.
+    """
+    key = str(db_path)
+    deadline = math.inf if interval_seconds < 0 else interval_seconds
+    with _STARTUP_SELF_HEAL_CACHE_LOCK:
+        cached = _STARTUP_SELF_HEAL_CACHE.get(key)
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < deadline:
+            return dict(cached[1])
+    result = startup_index_self_heal(conn)
+    if result.get("details") == ["integrity_check could not run"]:
+        return result
+    with _STARTUP_SELF_HEAL_CACHE_LOCK:
+        _STARTUP_SELF_HEAL_CACHE[key] = (time.monotonic(), dict(result))
+    return result
+
+
 def _prepare_private_sqlite_storage(db_path: Path) -> None:
     """Create or tighten one SQLite database path before SQLite opens it."""
     try:
@@ -438,7 +476,18 @@ class MessageStore:
             # — never rename or move the database file, so sibling processes'
             # open connections are unaffected.
             try:
-                heal = startup_index_self_heal(self._conn)
+                heal = _cached_startup_index_self_heal(
+                    self.db_path,
+                    self._conn,
+                    float(
+                        getattr(
+                            self._ingest_protection_config,
+                            "startup_self_heal_interval_seconds",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                )
             except Exception:
                 heal = {"healed": False, "details": ["self-heal probe failed"]}
             if heal.get("details"):

@@ -13,6 +13,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from hermes_trove import store
 from hermes_trove.sqlite_util import (
     _integrity_failure_details,
     _is_index_corruption_detail,
@@ -210,3 +213,91 @@ class TestRetryWorthyIngestError:
         assert pred(sqlite3.DatabaseError("database disk image is malformed")) is False
         assert pred(sqlite3.OperationalError("disk I/O error")) is False
         assert pred(sqlite3.OperationalError("no such table: foo")) is False
+
+
+class _CountingConn:
+    """Connection double that counts ``PRAGMA integrity_check`` executions."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.integrity_calls = 0
+
+    def execute(self, sql):
+        op = sql.strip().upper()
+        if op == "PRAGMA INTEGRITY_CHECK":
+            self.integrity_calls += 1
+            return _Rows([(d,) for d in self.script.pop(0)])
+        if op == "REINDEX":
+            return _Rows([])
+        raise AssertionError(sql)
+
+
+class _UnverifiableConn:
+    """Every statement fails, so the check cannot run at all."""
+
+    def execute(self, sql):
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.fixture(autouse=True)
+def _clear_startup_self_heal_cache():
+    store._STARTUP_SELF_HEAL_CACHE.clear()
+    yield
+    store._STARTUP_SELF_HEAL_CACHE.clear()
+
+
+class TestStartupSelfHealIntervalThrottle:
+    """The full integrity_check must not be re-run per agent clone.
+
+    ``TROVEEngine.clone_for_agent`` builds a new engine (and therefore a new
+    ``MessageStore``) for every isolated agent, so an unthrottled
+    ``startup_index_self_heal`` paid an O(database size) scan on each rebuild.
+    """
+
+    def test_second_open_within_interval_skips_the_scan(self, tmp_path: Path):
+        db = tmp_path / "a.db"
+        conn = _CountingConn([[]])
+        first = store._cached_startup_index_self_heal(db, conn, 300.0)
+        second = store._cached_startup_index_self_heal(db, conn, 300.0)
+        assert first == {"healed": False, "details": []}
+        assert second == first
+        assert conn.integrity_calls == 1, "re-ran integrity_check inside the window"
+
+    def test_zero_interval_checks_on_every_open(self, tmp_path: Path):
+        db = tmp_path / "b.db"
+        conn = _CountingConn([[], []])
+        store._cached_startup_index_self_heal(db, conn, 0.0)
+        store._cached_startup_index_self_heal(db, conn, 0.0)
+        assert conn.integrity_calls == 2, "0 must restore check-on-every-open"
+
+    def test_negative_interval_checks_once_per_process(self, tmp_path: Path):
+        db = tmp_path / "c.db"
+        conn = _CountingConn([[]])
+        store._cached_startup_index_self_heal(db, conn, -1.0)
+        store._cached_startup_index_self_heal(db, conn, -1.0)
+        assert conn.integrity_calls == 1
+
+    def test_paths_are_throttled_independently(self, tmp_path: Path):
+        conn = _CountingConn([[], []])
+        store._cached_startup_index_self_heal(tmp_path / "d1.db", conn, 300.0)
+        store._cached_startup_index_self_heal(tmp_path / "d2.db", conn, 300.0)
+        assert conn.integrity_calls == 2
+
+    def test_cached_damage_is_still_reported(self, tmp_path: Path):
+        """A skip must keep arming the startup write block from the cache."""
+        db = tmp_path / "e.db"
+        damage = ["Page 12 is never used"]
+        conn = _CountingConn([damage])
+        first = store._cached_startup_index_self_heal(db, conn, 300.0)
+        second = store._cached_startup_index_self_heal(db, conn, 300.0)
+        assert first["healed"] is False and first["details"] == damage
+        assert second == first, "cached damage was lost on the skipped open"
+        assert conn.integrity_calls == 1
+
+    def test_unverifiable_result_is_not_memoised(self, tmp_path: Path):
+        db = tmp_path / "f.db"
+        result = store._cached_startup_index_self_heal(
+            db, _UnverifiableConn(), 300.0
+        )
+        assert result == {"healed": False, "details": ["integrity_check could not run"]}
+        assert db not in store._STARTUP_SELF_HEAL_CACHE
