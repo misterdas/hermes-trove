@@ -473,6 +473,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_maintenance_budget_ms", "TROVE_ROLLUP_MAINTENANCE_BUDGET_MS", int),
     _EnvFieldSpec("retention_days", "TROVE_RETENTION_DAYS", int),
     _EnvFieldSpec("retention_apply_enabled", "TROVE_RETENTION_APPLY_ENABLED", bool),
+    _EnvFieldSpec(
+        "startup_self_heal_interval_seconds",
+        "TROVE_STARTUP_SELF_HEAL_INTERVAL_SECONDS",
+        float,
+    ),
 )
 
 _PARSER_BY_TYPE = {
@@ -874,6 +879,19 @@ class TROVEConfig:
     # the RETENTION_DAYS number is the safety gate (0 = never delete). Set this
     # to false only to hard-disable apply on shared/multi-user setups.
     retention_apply_enabled: bool = True
+
+    # -- Startup store self-heal throttle ---
+    # ``startup_index_self_heal`` issues a full ``PRAGMA integrity_check``, which
+    # is O(database size). Every agent clone constructs its own MessageStore, so
+    # on a conversation-style workload (first utterance after each rebuild) that
+    # cost was paid once per clone even though nothing changed on disk. This is
+    # the minimum number of seconds between two full checks for the SAME database
+    # path within one process. 0 = check on every open (previous behaviour); a
+    # negative value = check once per process per path. Detection across
+    # processes and across restarts is unchanged — only in-process repetition
+    # inside the window is skipped, and a previously-detected damage still arms
+    # the startup write block from the cached result.
+    startup_self_heal_interval_seconds: float = 300.0
 
     # -- Temporal rollups ---
     # Disabled by default; the engine's ingest/build hooks are flag-gated.
